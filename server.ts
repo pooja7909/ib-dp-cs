@@ -12,6 +12,7 @@ import { IB_EXAMINER_ROLE, IB_QUALIFICATION, IB_EXAM_BOARD, IB_SCHOOL, IB_SCOPE_
 import { VIRTUAL_FILES } from "./src/utils/pythonRunner.js";
 import { registerLearnRoutes, loadLearnData, learnClassesDb, learnProgressDb, learnNeedsFresh } from "./learnServer.js";
 import { registerIARoutes, loadIAData, iaClassesDb, iaProjectsDb, iaNeedsFresh } from "./iaServer.js";
+import { registerResourceRoutes, loadResourceData, resourcesForSync, applyRemoteResource, resourcesNeedsFresh } from "./resourcesServer.js";
 import {
   SyncedCollection,
   isSharedStoreEnabled,
@@ -6733,6 +6734,10 @@ registerLearnRoutes(app, { requireTeacher, runPythonTests, defaultFiles: VIRTUAL
 loadIAData(DATA_DIR);
 registerIARoutes(app, { requireTeacher });
 
+// ---------- Teacher resources (own web pages, worksheets, links shared with Learning Hub classes) ----------
+loadResourceData(DATA_DIR);
+registerResourceRoutes(app, { requireTeacher, isTeacher: isTeacherRequest, sign: (p) => signTokenPayload(p) });
+
 // ---------- Shared state collections (see serverStore.ts) ----------
 let sharedCollections: SyncedCollection[] | null = null;
 let pullInFlight: Promise<void> | null = null;
@@ -6852,15 +6857,18 @@ function initSharedCollections() {
     else iaProjectsDb[id] = value;
   });
 
+  // Metadata only: the files themselves are read on demand from "resource_files" (resourcesServer.ts)
+  const resources = new SyncedCollection("resources", resourcesForSync, applyRemoteResource);
+
   // Order matters: assessments must be pulled before their students.
-  sharedCollections = [assessments, students, questions, teachers, settings, dataFiles, learnClasses, learnProgress, iaClasses, iaProjects];
+  sharedCollections = [assessments, students, questions, teachers, settings, dataFiles, learnClasses, learnProgress, iaClasses, iaProjects, resources];
   for (const c of sharedCollections) c.captureBaseline();
 }
 
 // How long data already in memory is reused before checking the database again.
 // Every check costs at least one Firestore read per collection, and the free plan
 // allows ~50,000 reads a day, so routine requests reuse recent data.
-const HOT_COLLECTIONS = new Set(["assessments", "students", "learn_classes", "learn_progress", "ia_classes", "ia_projects"]);
+const HOT_COLLECTIONS = new Set(["assessments", "students", "learn_classes", "learn_progress", "ia_classes", "ia_projects", "resources"]);
 const HOT_TTL_MS = 15_000; // assessments + student progress
 const COLD_TTL_MS = 60_000; // teachers, settings, question bank, data files
 
@@ -6902,6 +6910,7 @@ function needsFreshData(req: express.Request): boolean | "all" {
   // Learning Hub student requests: fresh only when the class/student is new to this server copy
   if (/^\/learn\//.test(req.path)) return learnNeedsFresh(req);
   if (/^\/ia\//.test(req.path)) return iaNeedsFresh(req);
+  if (/^\/resources\//.test(req.path)) return resourcesNeedsFresh(req);
   // Student requests (join, autosave, submit) use data at most 15s old, unless they refer
   // to an assessment or student this server copy hasn't seen yet (checked below).
   const m = req.path.match(/^\/assessments\/([^/]+)/);
