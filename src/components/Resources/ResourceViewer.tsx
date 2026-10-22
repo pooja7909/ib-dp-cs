@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { X, ExternalLink, Download } from "lucide-react";
+import { X, ExternalLink, Download, ArrowLeft } from "lucide-react";
 import { TeacherResource, ResourceTypeIcon, viewMode, TopicBadges, needsPieces, fetchResourceBlob } from "./resourceTypes";
 
 // Uploaded web pages run in an opaque-origin sandbox (also enforced by the server's CSP header):
@@ -37,6 +37,26 @@ export const ResourceViewer: React.FC<{ resource: TeacherResource; src: string; 
     };
   }, [big, resource.id, access]); // eslint-disable-line react-hooks/exhaustive-deps
   const src = big ? blobUrl || "" : viewSrc;
+  // The browser's Back button (or a phone's back gesture) closes the viewer instead of leaving the hub
+  const closedByBack = React.useRef(false);
+  useEffect(() => {
+    try {
+      window.history.pushState({ ...(window.history.state || {}), resourceViewer: true }, "", window.location.href);
+    } catch (e) {}
+    const onPop = () => {
+      closedByBack.current = true;
+      onClose();
+    };
+    window.addEventListener("popstate", onPop);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      if (!closedByBack.current) {
+        try {
+          if (window.history.state && window.history.state.resourceViewer) window.history.back();
+        } catch (e) {}
+      }
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -51,6 +71,14 @@ export const ResourceViewer: React.FC<{ resource: TeacherResource; src: string; 
   return (
     <div className="fixed inset-0 z-[60] bg-slate-900/70 flex flex-col" data-testid="resource-viewer" role="dialog" aria-label={resource.title}>
       <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-white border-b border-slate-200">
+        <button
+          type="button"
+          onClick={onClose}
+          data-testid="resource-viewer-back"
+          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold inline-flex items-center gap-1"
+        >
+          <ArrowLeft className="w-4 h-4" /> Back
+        </button>
         <ResourceTypeIcon r={resource} />
         <div className="min-w-0 flex-1">
           <div className="font-bold text-slate-900 truncate">{resource.title}</div>
@@ -79,7 +107,7 @@ export const ResourceViewer: React.FC<{ resource: TeacherResource; src: string; 
       </div>
       {mode === "link" && (
         <div className="px-3 py-1.5 bg-amber-50 border-b border-amber-200 text-xs text-amber-900">
-          Some websites do not allow being shown inside another page. If this stays blank, use <b>Open in new tab</b>.
+          Some websites do not allow being shown inside another page. If this stays blank, use <b>Open in new tab</b>. Press <b>Back</b> (top left) to return to the hub.
         </div>
       )}
       <div className="flex-1 min-h-0 bg-slate-100">
