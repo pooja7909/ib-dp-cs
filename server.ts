@@ -1,0 +1,6959 @@
+import express from "express";
+import path from "path";
+import fs from "fs";
+import crypto from "crypto";
+import { spawn } from "child_process";
+import os from "os";
+import dotenv from "dotenv";
+import { GoogleGenAI } from "@google/genai";
+import { getAllIBTasks } from "./src/data/ibQuestionBank.js";
+import { IB_UNITS, classifyIBTopic, ensureIBUnit, isIBUnitCode, ibUnitTitle } from "./src/utils/ibTopics.js";
+import { IB_EXAMINER_ROLE, IB_QUALIFICATION, IB_EXAM_BOARD, IB_SCHOOL, IB_SCOPE_TEXT, ibExaminerContext } from "./ibExaminer.js";
+import { VIRTUAL_FILES } from "./src/utils/pythonRunner.js";
+import { registerLearnRoutes, loadLearnData, learnClassesDb, learnProgressDb, learnNeedsFresh } from "./learnServer.js";
+import { registerIARoutes, loadIAData, iaClassesDb, iaProjectsDb, iaNeedsFresh } from "./iaServer.js";
+import {
+  SyncedCollection,
+  isSharedStoreEnabled,
+  saveUploadChunk,
+  readUpload,
+  deleteUpload,
+  copyFromPreviousDatabase,
+  getMigrationMarker,
+  setMigrationMarker,
+  hasPreviousDatabase,
+  readPreviousCollection,
+} from "./serverStore.js";
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+
+// Master dictionary of all built-in tasks across curriculum modules
+const ALL_BUILTIN_TASKS: Record<string, any> = {};
+// IB DP Computer Science built-in bank (src/data/ibBankPaper1.ts / ibBankPaper2.ts). May be empty.
+for (const task of getAllIBTasks()) {
+  if (task && task.id) ALL_BUILTIN_TASKS[task.id] = task;
+}
+
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+// ==========================================
+// SHARED DATABASE SYNC (Vercel / serverless)
+// ==========================================
+// Every API request first pulls recent changes from Firestore, and every JSON
+// response waits until this request's changes are saved. This is what makes an
+// assessment created by the teacher visible to students on other server instances.
+/** Turns raw Firestore errors into a reason a teacher can act on. */
+function explainDatabaseError(err: any): string {
+  const msg = String(err?.message || err || "");
+  if (/PERMISSION_DENIED|insufficient permissions|Missing or insufficient/i.test(msg)) {
+    return "Firestore refused access (security rules). In the Firebase console open Firestore Database → Rules, paste the rules from firestore.rules in your code, and click Publish. Rules created in 'test mode' stop working after 30 days.";
+  }
+  if (/referer|referrer|API_KEY_HTTP_REFERRER_BLOCKED|API key not valid|API_KEY_INVALID|blocked/i.test(msg)) {
+    return "The Firebase API key is restricted or invalid for server use. In Google Cloud console → APIs & Services → Credentials, edit the Firebase browser key and allow the Cloud Firestore API (remove website-only restrictions), or add FIREBASE_SERVICE_ACCOUNT in Vercel.";
+  }
+  if (/NOT_FOUND|database .* does not exist|not found/i.test(msg)) {
+    return "The Firestore database named in firebase-applet-config.json (firestoreDatabaseId) was not found in the Firebase project.";
+  }
+  if (/has not been used|is disabled|SERVICE_DISABLED/i.test(msg)) {
+    return "The Cloud Firestore API is disabled for this Firebase project. Enable it in Google Cloud console → APIs & Services.";
+  }
+  if (/quota|RESOURCE_EXHAUSTED/i.test(msg)) {
+    return "The Firestore free daily quota has been used up. It resets daily, or enable billing (Blaze plan) in Firebase.";
+  }
+  if (/UNAVAILABLE|DEADLINE|timed out|ECONN|network|fetch failed/i.test(msg)) {
+    return "The server could not connect to Firestore (network/timeout). This is usually temporary; try again in a minute.";
+  }
+  return msg || "Unknown database error.";
+}
+
+app.use("/api", async (req, res, next) => {
+  // The health check runs its own database test (below) and must work even when the database doesn't
+  if (req.path === "/health") return next();
+  if (!isSharedStoreEnabled() || !sharedCollections) return next();
+  const fresh = needsFreshData(req);
+  const includeStudents =
+    fresh === "all" || !!req.headers.authorization || /\/join$/.test(req.path) || fresh === true;
+  try {
+    try {
+      await pullSharedState(fresh, includeStudents);
+    } catch (firstErr) {
+      // A server that has just woken up sometimes drops its first connection: retry once
+      console.warn("[store] Pull failed, retrying once:", firstErr);
+      await new Promise((r) => setTimeout(r, 700));
+      await pullSharedState(fresh, includeStudents);
+    }
+  } catch (err: any) {
+    console.error("[store] Pull failed:", err);
+    res.status(503).json({
+      error: "The app could not reach its database: " + explainDatabaseError(err),
+      detail: err?.message || String(err),
+    });
+    return;
+  }
+
+  const originalJson = res.json.bind(res);
+  let handled = false;
+  (res as any).json = (body: any) => {
+    if (handled) return originalJson(body);
+    handled = true;
+    pushSharedState()
+      .then(() => originalJson(body))
+      .catch((err: any) => {
+        console.error("[store] Push failed:", err);
+        if (!res.headersSent) {
+          res.status(500);
+          originalJson({ error: "Could not save changes to the database: " + (err?.message || String(err)) });
+        }
+      });
+    return res;
+  };
+  next();
+});
+
+// In-memory & file-backed persistent data store for live exams & teacher dashboard
+interface LiveStudentSession {
+  studentId: string;
+  questionComments?: Record<string, string>; // teacher comment per question (shown with results)
+  answerChecks?: Record<string, number>; // "Check answer" uses per question
+  name: string;
+  candidateNumber: string;
+  className: string;
+  status: "joined" | "in_progress" | "submitted";
+  currentQuestionIndex: number;
+  answeredQuestions: string[];
+  answers: Record<string, any>;
+  marks: Record<string, number>;
+  totalMarks: number;
+  maxMarks: number;
+  percentage: number;
+  joinedAt: number;
+  lastActiveAt: number;
+  submittedAt?: number;
+  feedback?: string;
+  markingNotes?: Record<string, string>;
+  reflectionSheet?: any;
+  aiDiagnostic?: {
+    overallSummary: string;
+    focusTopics: string[];
+    questionBreakdowns: {
+      questionId: string;
+      marksAwarded: number;
+      maxMarks: number;
+      studentError: string;
+      specTopic: string;
+      revisionAction: string;
+    }[];
+  };
+}
+
+interface ResultReleaseSettings {
+  resultsReleased: boolean;
+  shareTotalScore: boolean;
+  shareQuestionMarks: boolean;
+  shareMarkScheme: boolean;
+  shareSubmissionsAndAnswers: boolean;
+  shareTeacherFeedback: boolean;
+  shareReflectionSheet: boolean;
+  releasedAt?: number;
+  releasedStudentIds?: string[];
+}
+
+interface AssessmentStore {
+  id: string;
+  title: string;
+  ibLevel?: "SL" | "HL"; // IB level the assessment is set at
+  ownerId?: string; // teacher who created it
+  ownerName?: string;
+  code: string; // 6-digit access code for QR / PIN
+  type?: "task" | "assessment"; // "task" for practice tasks/classwork, "assessment" for formal timed exams
+  customHeaderBanner?: string;
+  customSubtitle?: string;
+  customInstructions?: string;
+  headerConfig?: {
+    schoolOrDepartment?: string;
+    subjectSubtitle?: string;
+    termOrClass?: string;
+    instructionsNotice?: string;
+    headerTheme?: string;
+  };
+  durationMinutes: number;
+  showScoreImmediately: boolean;
+  allowCopyPaste?: boolean;
+  showOperatorToolbar?: boolean;
+  shareSolutions?: boolean; // Teacher setting: whether students are allowed to view solutions/mark scheme
+  instantFeedback?: boolean; // Teacher setting: students may check each answer before moving on
+  classGroup?: string; // Teacher setting: class name recorded for every student who joins
+  feedbackDetail?: "result" | "tests" | "full"; // how much a check shows for programming questions
+  maxChecks?: number; // checks allowed per question (0 = unlimited)
+  releaseSettings?: ResultReleaseSettings;
+  questionIds: string[];
+  questions?: any[]; // Cached full question objects for cross-client consistency
+  maxMarks: number;
+  gradeBoundaries?: any;
+  createdAt: number;
+  status: "active" | "archived";
+  students: Record<string, LiveStudentSession>;
+}
+
+// Assessments created by teachers (the IB app has no built-in seed assessments)
+const assessmentsDb: Record<string, AssessmentStore> = {};
+
+// Custom questions uploaded or created by teachers
+const customQuestionsDb: Record<string, any> = {};
+
+const isServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+const SOURCE_DATA_DIR = path.join(process.cwd(), "data");
+const DATA_DIR = isServerless ? path.join("/tmp", "ibcs_data") : SOURCE_DATA_DIR;
+const ASSESSMENTS_FILE = path.join(DATA_DIR, "assessments_db.json");
+const CUSTOM_QUESTIONS_FILE = path.join(DATA_DIR, "custom_questions_db.json");
+const SETTINGS_FILE = path.join(DATA_DIR, "system_settings.json");
+
+interface SystemSettings {
+  allowPracticeCopyPaste: boolean;
+  /** false = the free Practice portal is closed for students (e.g. during exams) */
+  practiceOpen?: boolean;
+  /** Questions teachers deleted, so copies cached in browsers are removed too */
+  deletedQuestionIds?: string[];
+}
+
+const systemSettings: SystemSettings = {
+  allowPracticeCopyPaste: false,
+  practiceOpen: true,
+};
+
+/** Questions used in formal assessments that are still open: never shown in free Practice. */
+function questionIdsInLiveAssessments(): string[] {
+  const ids = new Set<string>();
+  for (const a of Object.values(assessmentsDb)) {
+    if (!a || a.type === "task" || a.status === "archived") continue;
+    for (const id of a.questionIds || []) ids.add(String(id));
+    for (const q of a.questions || []) if (q && (q as any).id) ids.add(String((q as any).id));
+    for (const id of Object.keys((a as any).retiredQuestions || {})) ids.add(id); // replaced questions too
+  }
+  return Array.from(ids);
+}
+
+// ==========================================
+// DATA FILE LIBRARY (files student programs can open)
+// ==========================================
+// Past-paper programming questions read data files supplied with the paper
+// (e.g. a .txt or .csv). Teachers upload them once; every student program can
+// then open them, both when running in the browser and when marked on the server.
+interface DataFileRecord {
+  name: string;
+  content: string;
+  uploadedAt: number;
+}
+const dataFilesDb: Record<string, DataFileRecord> = {};
+const DATA_FILES_FILE = path.join(DATA_DIR, "data_files.json");
+const MAX_DATA_FILE_CHARS = 1_500_000;
+
+function loadDataFiles() {
+  // With the shared database on (Vercel), /tmp copies may be stale; the database is the source of truth
+  if (isSharedStoreEnabled()) return;
+  try {
+    if (fs.existsSync(DATA_FILES_FILE)) {
+      Object.assign(dataFilesDb, JSON.parse(fs.readFileSync(DATA_FILES_FILE, "utf-8")) || {});
+    }
+  } catch (e) {
+    console.warn("Could not read data files library:", e);
+  }
+}
+function savePersistedDataFiles() {
+  try {
+    fs.writeFileSync(DATA_FILES_FILE, JSON.stringify(dataFilesDb));
+  } catch {}
+}
+
+/** Only a plain file name (no folders); keeps student code's open("Name.txt") working. */
+function cleanDataFileName(name: any): string {
+  const base = path.basename(String(name || "")).trim();
+  return /^[A-Za-z0-9 _.,()+-]{1,100}$/.test(base) && !base.startsWith(".") ? base : "";
+}
+
+/** Files a program for this task can open: built-in samples < library < files attached to the task. */
+function getFilesForTask(task: any): Record<string, string> {
+  const files: Record<string, string> = { ...VIRTUAL_FILES };
+  for (const f of Object.values(dataFilesDb)) files[f.name] = f.content;
+  if (task && task.dataFiles && typeof task.dataFiles === "object") {
+    for (const [n, c] of Object.entries(task.dataFiles)) {
+      const clean = cleanDataFileName(n);
+      if (clean) files[clean] = String(c ?? "");
+    }
+  }
+  return files;
+}
+
+function loadPersistedData() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+
+    // 1. Always load baseline repository seed data from SOURCE_DATA_DIR first
+    const sourceAssessments = path.join(SOURCE_DATA_DIR, "assessments_db.json");
+    if (fs.existsSync(sourceAssessments)) {
+      try {
+        const content = fs.readFileSync(sourceAssessments, "utf-8");
+        const loaded = JSON.parse(content);
+        if (loaded && typeof loaded === "object") {
+          Object.assign(assessmentsDb, loaded);
+        }
+      } catch (err) {
+        console.warn("Could not read source assessments:", err);
+      }
+    }
+
+    const sourceQuestions = path.join(SOURCE_DATA_DIR, "custom_questions_db.json");
+    if (fs.existsSync(sourceQuestions)) {
+      try {
+        const content = fs.readFileSync(sourceQuestions, "utf-8");
+        const loaded = JSON.parse(content);
+        if (loaded && typeof loaded === "object") {
+          Object.assign(customQuestionsDb, loaded);
+        }
+      } catch (err) {
+        console.warn("Could not read source custom questions:", err);
+      }
+    }
+
+    const sourceSettings = path.join(SOURCE_DATA_DIR, "system_settings.json");
+    if (fs.existsSync(sourceSettings)) {
+      try {
+        const content = fs.readFileSync(sourceSettings, "utf-8");
+        const loaded = JSON.parse(content);
+        if (loaded && typeof loaded === "object") {
+          Object.assign(systemSettings, loaded);
+        }
+      } catch (err) {}
+    }
+
+    // 2. Layer any newer data written to DATA_DIR (e.g. /tmp on Vercel)
+    if (DATA_DIR !== SOURCE_DATA_DIR && !isSharedStoreEnabled()) {
+      if (fs.existsSync(ASSESSMENTS_FILE)) {
+        try {
+          const content = fs.readFileSync(ASSESSMENTS_FILE, "utf-8");
+          const loaded = JSON.parse(content);
+          if (loaded && typeof loaded === "object") {
+            Object.assign(assessmentsDb, loaded);
+          }
+        } catch (err) {}
+      }
+      if (fs.existsSync(CUSTOM_QUESTIONS_FILE)) {
+        try {
+          const content = fs.readFileSync(CUSTOM_QUESTIONS_FILE, "utf-8");
+          const loaded = JSON.parse(content);
+          if (loaded && typeof loaded === "object") {
+            Object.assign(customQuestionsDb, loaded);
+          }
+        } catch (err) {}
+      }
+      if (fs.existsSync(SETTINGS_FILE)) {
+        try {
+          const content = fs.readFileSync(SETTINGS_FILE, "utf-8");
+          const loaded = JSON.parse(content);
+          if (loaded && typeof loaded === "object") {
+            Object.assign(systemSettings, loaded);
+          }
+        } catch (err) {}
+      }
+    }
+
+    // Initialize sample text files for B2.5 File processing
+    const sampleFiles: Record<string, string> = {
+      "message.txt": "Welcome to Computer Science\nGood luck with Paper 2!\n",
+      "names.txt": "Alice\nBob\nCharlie\nDiana\n",
+      "scores.txt": "Alice,85\nBob,42\nCharlie,90\nDiana,68\nEthan,55\n",
+      "runners.txt": "Sara,12.4\nLeo,11.8\nMia,13.1\nNoah,12.0\n",
+      "sales.txt": "Book,12.50,4\nPen,1.20,10\nRuler,0.80,5\nFolder,3.50,2\n",
+    };
+    for (const [fname, fcontent] of Object.entries(sampleFiles)) {
+      const p1 = path.join(DATA_DIR, fname);
+      const p2 = path.join(process.cwd(), fname);
+      if (!fs.existsSync(p1)) {
+        try { fs.writeFileSync(p1, fcontent, "utf-8"); } catch (e) {}
+      }
+      if (!fs.existsSync(p2)) {
+        try { fs.writeFileSync(p2, fcontent, "utf-8"); } catch (e) {}
+      }
+    }
+  } catch (err) {
+    console.warn("Could not load persisted data from disk:", err);
+  }
+}
+
+function savePersistedSettings() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(systemSettings, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("Could not save system settings:", err);
+  }
+}
+
+function savePersistedAssessments() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(ASSESSMENTS_FILE, JSON.stringify(assessmentsDb, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("Could not save assessments to disk:", err);
+  }
+}
+
+function savePersistedQuestions() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(CUSTOM_QUESTIONS_FILE, JSON.stringify(customQuestionsDb, null, 2), "utf-8");
+  } catch (err) {
+    console.warn("Could not save custom questions to disk:", err);
+  }
+}
+
+// ==========================================
+// SECURE MULTI-TEACHER AUTHENTICATION & SESSIONS
+// ==========================================
+const TEACHERS_DB_FILE = path.join(DATA_DIR, "teachers_db.json");
+const TEACHER_AUTH_FILE = path.join(DATA_DIR, "teacher_auth.json");
+
+export interface TeacherProfile {
+  id: string;
+  email: string;
+  name: string;
+  school: string;
+  department: string;
+  role: "teacher" | "head_of_dept" | "examiner";
+  avatarColor: string;
+  createdAt: number;
+}
+
+export interface TeacherRecord extends TeacherProfile {
+  salt: string;
+  hash: string;
+}
+
+const activeTeacherTokens = new Map<
+  string,
+  { teacherId: string; createdAt: number; lastActive: number }
+>();
+
+function hashTeacherPassword(password: string, salt: string): string {
+  return crypto.pbkdf2Sync(password, salt, 100000, 64, "sha512").toString("hex");
+}
+
+let teachersDb: Record<string, TeacherRecord> = {};
+
+function savePersistedTeachers(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    fs.writeFileSync(TEACHERS_DB_FILE, JSON.stringify(teachersDb, null, 2), "utf-8");
+  } catch (e) {
+    console.warn("Failed to persist teachers db:", e);
+  }
+}
+
+function loadOrCreateTeachers(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+
+    // 1. Load seed teachers from SOURCE_DATA_DIR first if exists
+    const sourceTeachers = path.join(SOURCE_DATA_DIR, "teachers_db.json");
+    if (fs.existsSync(sourceTeachers)) {
+      try {
+        const content = fs.readFileSync(sourceTeachers, "utf-8");
+        const parsed = JSON.parse(content);
+        if (parsed && typeof parsed === "object") {
+          teachersDb = parsed;
+        }
+      } catch (e) {}
+    }
+
+    // 2. Layer from DATA_DIR if present
+    if (DATA_DIR !== SOURCE_DATA_DIR && !isSharedStoreEnabled() && fs.existsSync(TEACHERS_DB_FILE)) {
+      try {
+        const content = fs.readFileSync(TEACHERS_DB_FILE, "utf-8");
+        const parsed = JSON.parse(content);
+        if (parsed && typeof parsed === "object") {
+          Object.assign(teachersDb, parsed);
+        }
+      } catch (e) {}
+    } else if (DATA_DIR === SOURCE_DATA_DIR && fs.existsSync(TEACHERS_DB_FILE)) {
+      const content = fs.readFileSync(TEACHERS_DB_FILE, "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === "object") {
+        teachersDb = parsed;
+      }
+    }
+  } catch (e) {
+    console.warn("Error reading teachers_db file:", e);
+  }
+
+  // If no teachers exist, import legacy teacher_auth.json or seed default head of department
+  if (Object.keys(teachersDb).length === 0) {
+    // Deterministic salt so every serverless instance builds the identical default
+    // account (a random salt would make tokens from one instance fail on another).
+    let initialSalt = crypto.createHash("sha256").update("default-teacher-salt:" + getTokenSecret()).digest("hex").slice(0, 32);
+    let initialHash = hashTeacherPassword(process.env.TEACHER_PASSCODE || "ibcs-teacher", initialSalt);
+
+    if (fs.existsSync(TEACHER_AUTH_FILE)) {
+      try {
+        const legacy = JSON.parse(fs.readFileSync(TEACHER_AUTH_FILE, "utf-8"));
+        if (legacy && legacy.salt && legacy.hash) {
+          initialSalt = legacy.salt;
+          initialHash = legacy.hash;
+        }
+      } catch (e) {}
+    }
+
+    const defaultTeacher: TeacherRecord = {
+      id: "t_primary",
+      email: "teacher@bisb-ibcs.local",
+      name: "Faculty Head of Computer Science",
+      school: IB_SCHOOL,
+      department: "Computer Science & IT",
+      role: "head_of_dept",
+      avatarColor: "purple",
+      createdAt: Date.now(),
+      salt: initialSalt,
+      hash: initialHash,
+    };
+
+    teachersDb[defaultTeacher.id] = defaultTeacher;
+    savePersistedTeachers();
+  }
+}
+
+loadOrCreateTeachers();
+loadDataFiles();
+
+// Teacher sessions use signed tokens so they stay valid on every serverless
+// instance (an in-memory session list is lost whenever Vercel starts a new one).
+// Format: tea_<base64url payload>.<HMAC signature>
+const TEACHER_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+function getTokenSecret(): string {
+  if (process.env.TEACHER_TOKEN_SECRET) return process.env.TEACHER_TOKEN_SECRET;
+  // Fallback keeps the app working, but set TEACHER_TOKEN_SECRET in Vercel for proper security.
+  return crypto
+    .createHash("sha256")
+    .update("ibcs-token-secret:" + (process.env.GEMINI_API_KEY || "") + ":" + (process.env.TEACHER_PASSCODE || "ibcs-teacher"))
+    .digest("hex");
+}
+
+function signTokenPayload(payload: string): string {
+  return crypto.createHmac("sha256", getTokenSecret()).update(payload).digest("base64url");
+}
+
+function issueTeacherToken(teacherId: string): string {
+  const teacher = teachersDb[teacherId];
+  const payload = Buffer.from(
+    JSON.stringify({
+      tid: teacherId,
+      exp: Date.now() + TEACHER_TOKEN_TTL_MS,
+      // Changing the password changes this value, which invalidates old tokens.
+      pv: teacher ? teacher.hash.slice(0, 12) : "",
+    })
+  ).toString("base64url");
+  return `tea_${payload}.${signTokenPayload(payload)}`;
+}
+
+function getTeacherFromToken(token?: string): TeacherProfile | undefined {
+  if (!token || !token.startsWith("tea_")) return undefined;
+  const body = token.slice(4);
+  const dot = body.lastIndexOf(".");
+  if (dot <= 0) return undefined;
+  const payload = body.slice(0, dot);
+  const sig = body.slice(dot + 1);
+  const expected = signTokenPayload(payload);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return undefined;
+
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+    if (!data || typeof data.exp !== "number" || data.exp < Date.now()) return undefined;
+    const record = teachersDb[data.tid];
+    if (!record) return undefined;
+    if (data.pv && record.hash.slice(0, 12) !== data.pv) return undefined;
+    const { salt, hash, ...profile } = record;
+    return profile;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractToken(req: express.Request): string | undefined {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.substring(7).trim();
+  }
+  // Fallback: check query parameter or cookie
+  if (req.query && typeof req.query.token === "string") {
+    return req.query.token.trim();
+  }
+  return undefined;
+}
+
+function getTeacherFromRequest(req: express.Request): TeacherProfile | undefined {
+  const token = extractToken(req);
+  return getTeacherFromToken(token);
+}
+
+function isTeacherRequest(req: express.Request): boolean {
+  return !!getTeacherFromRequest(req);
+}
+
+function requireTeacher(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const teacher = getTeacherFromRequest(req);
+
+  if (!teacher) {
+    res.status(401).json({
+      error: "Unauthorized: Teacher session credentials required. Please re-enter the Teacher passcode.",
+      code: "TEACHER_AUTH_REQUIRED",
+    });
+    return;
+  }
+  // Attach teacher to request
+  (req as any).teacher = teacher;
+  next();
+}
+
+// ==========================================
+// SERVER-SIDE CODE RUNNER & GRADING UTILITIES
+// ==========================================
+function executePythonCode(
+  code: string,
+  inputs: string[] = [],
+  files?: Record<string, string>
+): Promise<{ out: string; err: string | null }> {
+  // Each run gets its own folder containing the data files, so file-handling
+  // programs can open them and can't interfere with each other.
+  let workDir: string | undefined;
+  if (files) {
+    try {
+      workDir = fs.mkdtempSync(path.join(os.tmpdir(), "pyrun-"));
+      for (const [name, content] of Object.entries(files)) {
+        const clean = cleanDataFileName(name);
+        if (clean) fs.writeFileSync(path.join(workDir, clean), String(content ?? ""));
+      }
+    } catch (e) {
+      console.warn("[python] Could not prepare data files:", e);
+    }
+  }
+  const cleanup = () => {
+    if (workDir) {
+      try {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      } catch {}
+    }
+  };
+
+  return new Promise<{ out: string; err: string | null }>((resolve) => {
+    let resolved = false;
+    let stdout = "";
+    let stderr = "";
+
+    const proc = spawn("python3", ["-c", code], {
+      timeout: 4000,
+      ...(workDir ? { cwd: workDir } : {}),
+    });
+
+    const timer = setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        try {
+          proc.kill("SIGKILL");
+        } catch (e) {}
+        resolve({ out: stdout, err: "Execution timed out (exceeded 4s limit)." });
+      }
+    }, 4000);
+
+    proc.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+      if (stdout.length > 50000) {
+        stdout = stdout.slice(0, 50000);
+      }
+    });
+
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    if (inputs && inputs.length > 0) {
+      try {
+        proc.stdin.write(inputs.join("\n") + "\n");
+      } catch (e) {}
+    }
+    try {
+      proc.stdin.end();
+    } catch (e) {}
+
+    proc.on("close", (exitCode) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({
+          out: stdout,
+          err: exitCode === 0 ? null : (stderr.trim() || `Program exited with code ${exitCode}`),
+        });
+      }
+    });
+
+    proc.on("error", (err) => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({ out: stdout, err: err.message });
+      }
+    });
+  }).finally(cleanup);
+}
+
+function normalizeOutput(s: string): string {
+  return String(s || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+function stripPrompts(s: string): string {
+  const norm = normalizeOutput(s);
+  const lines = norm.split("\n");
+  const cleaned = lines.map((line) => {
+    const promptMatch = line.match(/^([A-Za-z0-9 _\-\(\)\$#@]+[:?=]\s*)(.+)$/);
+    if (promptMatch && promptMatch[2]) {
+      return promptMatch[2].trim();
+    }
+    return line;
+  });
+  return cleaned.join("\n").trim();
+}
+
+function extractNumbers(s: string): number[] {
+  const matches = (s || "").match(/-?\d+(?:\.\d+)?/g);
+  if (!matches) return [];
+  return matches.map(Number).filter((n) => !isNaN(n));
+}
+
+function flexibleCompareOutputs(
+  actual: string,
+  expected: string
+): { matches: boolean; reason: string } {
+  const actNorm = normalizeOutput(actual);
+  const expNorm = normalizeOutput(expected);
+
+  // 1. Exact normalized match
+  if (actNorm === expNorm) {
+    return { matches: true, reason: "exact_match" };
+  }
+
+  // 2. Prompt-stripped match (e.g. "Result: 42" vs "42", "Pass" vs "Pass")
+  const actStripped = stripPrompts(actual);
+  const expStripped = stripPrompts(expected);
+  if (actStripped === expNorm || actStripped === expStripped) {
+    return { matches: true, reason: "prompt_stripped_match" };
+  }
+
+  // 3. Case-insensitive match (e.g. "pass" vs "Pass", "yes" vs "Yes")
+  if (actNorm.toLowerCase() === expNorm.toLowerCase()) {
+    return { matches: true, reason: "case_insensitive_match" };
+  }
+  if (actStripped.toLowerCase() === expStripped.toLowerCase()) {
+    return { matches: true, reason: "prompt_stripped_case_match" };
+  }
+
+  // 4. Numeric tolerance match (e.g. 12.5 vs 12.50, 4.0 vs 4, or float epsilon ±0.02)
+  const actNums = extractNumbers(actStripped || actNorm);
+  const expNums = extractNumbers(expStripped || expNorm);
+
+  if (expNums.length > 0 && actNums.length === expNums.length) {
+    let allNumsMatch = true;
+    for (let i = 0; i < expNums.length; i++) {
+      const diff = Math.abs(actNums[i] - expNums[i]);
+      if (diff > 0.02 && diff / Math.max(0.001, Math.abs(expNums[i])) > 0.01) {
+        allNumsMatch = false;
+        break;
+      }
+    }
+    if (allNumsMatch) {
+      return { matches: true, reason: "numeric_equivalence_match" };
+    }
+  }
+
+  // If expected is a single number and student printed it as the final answer
+  if (expNums.length === 1 && actNums.length > 0) {
+    const lastActNum = actNums[actNums.length - 1];
+    if (Math.abs(lastActNum - expNums[0]) <= 0.02) {
+      return { matches: true, reason: "final_numeric_match" };
+    }
+  }
+
+  // 5. Line presence match
+  const actLines = actNorm.split("\n").map((l) => l.trim()).filter(Boolean);
+  const expLines = expNorm.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  if (actLines.length > 0 && expLines.length === 1) {
+    const target = expLines[0].toLowerCase().trim();
+    const strippedTarget = stripPrompts(expLines[0]).toLowerCase().trim();
+
+    const lastAct = actLines[actLines.length - 1];
+    const strippedLastAct = stripPrompts(lastAct);
+    if (
+      lastAct === expLines[0] ||
+      lastAct.toLowerCase() === target ||
+      strippedLastAct === expLines[0] ||
+      strippedLastAct.toLowerCase() === strippedTarget
+    ) {
+      return { matches: true, reason: "last_line_match" };
+    }
+
+    const anyLineMatch = actLines.some((l) => {
+      const low = l.toLowerCase().trim();
+      const str = stripPrompts(l).toLowerCase().trim();
+      return (
+        low === target ||
+        str === strippedTarget ||
+        low.replace(/\s+/g, " ") === target.replace(/\s+/g, " ") ||
+        str.replace(/\s+/g, " ") === strippedTarget.replace(/\s+/g, " ")
+      );
+    });
+    if (anyLineMatch) {
+      return { matches: true, reason: "line_presence_match" };
+    }
+  }
+
+  // 6. Multiline sequence match
+  if (actLines.length === expLines.length && expLines.length > 1) {
+    let allLinesMatch = true;
+    for (let i = 0; i < expLines.length; i++) {
+      const a = stripPrompts(actLines[i]).toLowerCase().replace(/\s+/g, " ");
+      const e = stripPrompts(expLines[i]).toLowerCase().replace(/\s+/g, " ");
+      if (a !== e) {
+        allLinesMatch = false;
+        break;
+      }
+    }
+    if (allLinesMatch) {
+      return { matches: true, reason: "multiline_flexible_match" };
+    }
+  }
+
+  // 7. Token inclusion match
+  const expTokens = expNorm.toLowerCase().split(/[\s,;:|]+/).filter(Boolean);
+  const actTokens = actNorm.toLowerCase().split(/[\s,;:|]+/).filter(Boolean);
+  if (expTokens.length > 0 && expTokens.length <= 4 && actTokens.length >= expTokens.length) {
+    let matchedCount = 0;
+    for (const t of expTokens) {
+      if (actTokens.includes(t)) matchedCount++;
+    }
+    if (matchedCount === expTokens.length) {
+      return { matches: true, reason: "token_inclusion_match" };
+    }
+  }
+
+  return { matches: false, reason: "mismatch" };
+}
+
+function compareOutputs(actual: string, expected: string): boolean {
+  return flexibleCompareOutputs(actual, expected).matches;
+}
+
+function detectAntiHardcoding(
+  code: string,
+  tests: any[]
+): { isHardcoded: boolean; reason?: string } {
+  if (!code || !tests || tests.length === 0) {
+    return { isHardcoded: false };
+  }
+
+  const cleaned = code
+    .replace(/#.*$/gm, "")
+    .replace(/'''[\s\S]*?'''/g, "")
+    .replace(/"""[\s\S]*?"""/g, "")
+    .trim();
+
+  const testsWithInputs = tests.filter((t: any) => t.in && t.in.length > 0);
+  const distinctOutputs = new Set(tests.map((t: any) => normalizeOutput(t.out).toLowerCase())).size;
+
+  if (testsWithInputs.length >= 2 && distinctOutputs >= 2) {
+    const hasInputCall = /\binput\s*\(/.test(cleaned) || /\bsys\.stdin\b/.test(cleaned);
+    const hasDef = /\bdef\s+\w+\s*\([^)]+\)/.test(cleaned);
+
+    if (!hasInputCall && !hasDef) {
+      const hasPrint = /\bprint\s*\(/.test(cleaned);
+      if (hasPrint) {
+        return {
+          isHardcoded: true,
+          reason:
+            "Hardcoded output detected: The question requires reading dynamic inputs. Your solution must call input() rather than printing static values.",
+        };
+      }
+    }
+  }
+
+  const ifCount = (cleaned.match(/\b(if|elif)\b/g) || []).length;
+  const printCount = (cleaned.match(/\bprint\s*\(/g) || []).length;
+  const hasArithmeticOrLoops =
+    /[+\-*/%]|(\bfor\b)|(\bwhile\b)|(\bsum\b)|(\blen\b)|(\bappend\b)|(\bint\b)|(\bfloat\b)/.test(
+      cleaned
+    );
+
+  if (tests.length >= 3 && ifCount >= 3 && printCount >= 3 && !hasArithmeticOrLoops) {
+    let literalOutputsCount = 0;
+    for (const t of tests) {
+      const expStr = normalizeOutput(t.out).replace(/\n/g, "");
+      if (expStr && cleaned.includes(expStr)) {
+        literalOutputsCount++;
+      }
+    }
+    if (literalOutputsCount >= 3) {
+      return {
+        isHardcoded: true,
+        reason:
+          "Hardcoded lookups detected: Solutions must compute answers dynamically using algorithms, variables, and calculations rather than hardcoding static output tables.",
+      };
+    }
+  }
+
+  return { isHardcoded: false };
+}
+
+function normalizeStringAnswer(s: string | number | null | undefined): string {
+  return String(s ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/^[#\s]+/, "")
+    .replace(/[.\u2019']+$/, "")
+    .replace(/^["'\u201c]+|["'\u201d]+$/g, "");
+}
+
+function cellMatches(given: string | undefined, expected: string | number): boolean {
+  const g = normalizeStringAnswer(given);
+  return String(expected)
+    .split("|")
+    .some((alt) => normalizeStringAnswer(alt) === g);
+}
+
+// ==========================================
+// STUDENT PAYLOAD SANITIZATION
+// Prevents students from inspecting solutions, hints, or mark schemes
+// ==========================================
+function sanitizeTaskForStudent(task: any, allowHints = false) {
+  if (!task) return task;
+  const safe = { ...task };
+
+  // Strip master solution and mark scheme
+  delete safe.solution;
+  delete safe.markScheme;
+
+  if (!allowHints) {
+    delete safe.hint;
+  }
+
+  // Sanitize MCQ questions
+  if (safe.mcqs && Array.isArray(safe.mcqs)) {
+    safe.mcqs = safe.mcqs.map((m: any) => {
+      const copy = { ...m };
+      delete copy.a;
+      delete copy.why;
+      return copy;
+    });
+  }
+
+  // Sanitize inspect sub-questions
+  if (safe.subQuestions && Array.isArray(safe.subQuestions)) {
+    safe.subQuestions = safe.subQuestions.map((sq: any) => {
+      const copy = { ...sq };
+      delete copy.a;
+      delete copy.why;
+      return copy;
+    });
+  }
+
+  // Sanitize table questions
+  if (safe.tableRows && Array.isArray(safe.tableRows)) {
+    safe.tableRows = safe.tableRows.map((row: any) => {
+      if (!row || !row.c || !Array.isArray(row.c)) return row;
+      return {
+        ...row,
+        c: row.c.map((cell: any) => {
+          if (!cell) return cell;
+          if (cell.g) {
+            return { g: true, v: cell.v };
+          } else {
+            return { g: false, v: "" };
+          }
+        }),
+      };
+    });
+  }
+
+  // Sanitize theory questions
+  if (safe.theorySubQuestions && Array.isArray(safe.theorySubQuestions)) {
+    safe.theorySubQuestions = safe.theorySubQuestions.map((t: any) => {
+      const copy = { ...t };
+      delete copy.keywords;
+      delete copy.criteria;
+      return copy;
+    });
+  }
+
+  // Mark points (from uploaded mark schemes) are examiner-only
+  delete safe.markPoints;
+  delete safe.markThresholds;
+  delete safe.why;
+
+  // MCQ / inspect / theory items stored under "questions" (format used by uploaded papers)
+  if (Array.isArray(safe.questions)) {
+    safe.questions = safe.questions.map((q: any) => {
+      if (!q || typeof q !== "object") return q;
+      const copy = { ...q };
+      delete copy.a;
+      delete copy.why;
+      delete copy.accepted;
+      delete copy.keywords;
+      delete copy.criteria;
+      return copy;
+    });
+  }
+
+  // Trace tables: keep given cells, blank the answers. Sort tasks: keep only the grid shape.
+  if (Array.isArray(safe.rows)) {
+    if (safe.type === "sort") {
+      safe.rows = safe.rows.map((row: any) => (Array.isArray(row) ? row.map(() => "") : row));
+    } else {
+      safe.rows = safe.rows.map((row: any) =>
+        Array.isArray(row)
+          ? row.map((cell: any) =>
+              cell && typeof cell === "object" ? (cell.g ? { g: true, v: cell.v } : { g: false, v: "" }) : cell
+            )
+          : row
+      );
+    }
+  }
+
+  // Sub-parts such as 1(a), 1(b) from uploaded papers
+  if (Array.isArray(safe.parts)) {
+    safe.parts = safe.parts.map((p: any) => {
+      if (!p || typeof p !== "object") return p;
+      const copy = { ...p };
+      delete copy.solution;
+      delete copy.markScheme;
+      delete copy.markPoints;
+      delete copy.correctOption;
+      if (Array.isArray(copy.tests)) copy.tests = copy.tests.map((tc: any) => ({ ...tc, out: undefined }));
+      return copy;
+    });
+  }
+
+  // Sanitize test cases: students get input so they can test code, but not expected outputs
+  if (safe.tests && Array.isArray(safe.tests)) {
+    safe.tests = safe.tests.map((tc: any) => {
+      const copy = { ...tc };
+      delete copy.out;
+      return copy;
+    });
+  }
+
+  return safe;
+}
+
+// ---------- Multiple choice: each student sees the options in their own order ----------
+// The order is fixed per student (the same after a refresh), so position gives nothing away.
+// Answers are stored and marked in the original order, so teachers see them as written.
+function seededOrder(seed: string, n: number): number[] {
+  let h = crypto.createHash("sha256").update(seed).digest();
+  let k = 0;
+  const next = () => {
+    if (k + 4 > h.length) {
+      h = crypto.createHash("sha256").update(h).digest();
+      k = 0;
+    }
+    const v = h.readUInt32BE(k);
+    k += 4;
+    return v / 0x100000000;
+  };
+  const order = Array.from({ length: n }, (_, i) => i);
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(next() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  return order;
+}
+
+/** Shown position -> original option index, or null when this item must not be shuffled. */
+function mcqOrderFor(assessmentId: string, studentId: string, task: any, itemIndex: number): number[] | null {
+  if (!task || task.type !== "mcq" || !Array.isArray(task.questions)) return null;
+  const item = task.questions[itemIndex];
+  const options: any[] = item && Array.isArray(item.options) ? item.options : [];
+  if (options.length < 3) return null; // e.g. True/False, Yes/No
+  // Tick tables (every row has the same column headings): keep the columns in place
+  if (task.questions.length > 1) {
+    const first = JSON.stringify(task.questions[0]?.options || []);
+    if (task.questions.every((q: any) => JSON.stringify(q?.options || []) === first)) return null;
+  }
+  // Options that refer to other options ("All of the above", "Both A and B") must stay in place
+  if (options.some((o) => /\b(all|none|both|neither) of (the )?(above|these)\b|\bboth [a-d] and [a-d]\b|^\s*[a-d]\s*(and|&)\s*[a-d]\s*$/i.test(String(o)))) return null;
+  const order = seededOrder(`${assessmentId}:${studentId}:${task.id}:${itemIndex}`, options.length);
+  return order.every((v, i) => v === i) ? null : order;
+}
+
+function shuffleTaskForStudent(task: any, assessmentId: string, studentId: string): any {
+  if (!task || task.type !== "mcq" || !Array.isArray(task.questions)) return task;
+  return {
+    ...task,
+    questions: task.questions.map((q: any, i: number) => {
+      const order = mcqOrderFor(assessmentId, studentId, task, i);
+      if (!order || !q || !Array.isArray(q.options)) return q;
+      return { ...q, options: order.map((orig) => q.options[orig]) };
+    }),
+  };
+}
+
+/** Converts one answer between the student's order and the original order. */
+function convertMcqAnswer(task: any, assessmentId: string, studentId: string, answer: any, toOriginal: boolean): any {
+  if (!task || task.type !== "mcq" || !Array.isArray(task.questions)) return answer;
+  const arr = Array.isArray(answer) ? answer : answer !== null && answer !== undefined ? [answer] : null;
+  if (!arr) return answer;
+  const out = arr.map((given: any, i: number) => {
+    const order = mcqOrderFor(assessmentId, studentId, task, i);
+    if (!order || given === null || given === undefined || given === "") return given;
+    const n = Number(given);
+    if (!Number.isInteger(n) || n < 0 || n >= order.length) return given;
+    const converted = toOriginal ? order[n] : order.indexOf(n);
+    return typeof given === "string" ? String(converted) : converted;
+  });
+  return Array.isArray(answer) ? out : out[0];
+}
+
+function convertAnswersMap(a: AssessmentStore, studentId: string, answers: any, toOriginal: boolean): any {
+  if (!answers || typeof answers !== "object") return answers;
+  const questions: any[] = (enrichAssessment(a).questions || []) as any[];
+  const byId: Record<string, any> = {};
+  for (const q of questions) if (q && q.id) byId[q.id] = q;
+  const out: Record<string, any> = { ...answers };
+  for (const [qid, v] of Object.entries(answers)) {
+    if (byId[qid]) out[qid] = convertMcqAnswer(byId[qid], a.id, studentId, v, toOriginal);
+  }
+  return out;
+}
+
+function studentViewOfSession(a: AssessmentStore, s: any): any {
+  if (!s) return s;
+  return { ...s, answers: convertAnswersMap(a, s.studentId, s.answers || {}, false) };
+}
+
+function sanitizeAssessmentForStudent(a: AssessmentStore, studentId?: string) {
+  if (!a) return a;
+  const safe = {
+    id: a.id,
+    title: a.title,
+    ibLevel: (a as any).ibLevel,
+    code: a.code,
+    type: a.type || "assessment",
+    customHeaderBanner: a.customHeaderBanner,
+    customSubtitle: a.customSubtitle,
+    customInstructions: a.customInstructions,
+    headerConfig: a.headerConfig,
+    durationMinutes: a.durationMinutes,
+    showScoreImmediately: a.showScoreImmediately,
+    allowCopyPaste: a.allowCopyPaste !== undefined ? Boolean(a.allowCopyPaste) : (a.type === "task"),
+    showOperatorToolbar: a.showOperatorToolbar !== undefined ? Boolean(a.showOperatorToolbar) : (a.type === "task"),
+    shareSolutions: a.shareSolutions !== undefined ? Boolean(a.shareSolutions) : (a.type === "task"),
+    instantFeedback: Boolean(a.instantFeedback),
+    feedbackDetail: a.feedbackDetail || "tests",
+    maxChecks: a.maxChecks ?? 3,
+    classGroup: a.classGroup || undefined,
+    questionIds: a.questionIds || [],
+    maxMarks: a.maxMarks,
+    gradeBoundaries: a.gradeBoundaries,
+    createdAt: a.createdAt,
+    status: a.status,
+    questions: (a.questions || []).map((q: any) => {
+      const clean = sanitizeTaskForStudent(q, a.type === "task");
+      return studentId ? shuffleTaskForStudent(clean, a.id, studentId) : clean;
+    }),
+  };
+  return safe;
+}
+
+// Initialize Gemini lazily
+let geminiClient: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI | null {
+  if (!geminiClient && process.env.GEMINI_API_KEY) {
+    geminiClient = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  }
+  return geminiClient;
+}
+
+// Resilient Gemini generator with exponential backoff and model cascade
+// Prevents 503 (high demand) and 429 (rate limits) from breaking features
+function isTransientGeminiError(err: any): boolean {
+  const msg = String(err?.message || "");
+  return (
+    err?.status === 503 ||
+    err?.code === 503 ||
+    err?.status === 429 ||
+    err?.code === 429 ||
+    err?.status === 500 ||
+    msg.includes("503") ||
+    msg.includes("429") ||
+    msg.includes("high demand") ||
+    msg.includes("overloaded") ||
+    msg.includes("UNAVAILABLE") ||
+    msg.includes("RESOURCE_EXHAUSTED") ||
+    msg.includes("INTERNAL") ||
+    /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|aborted|AbortError|TimeoutError|timed out/i.test(msg) ||
+    err?.name === "AbortError" ||
+    err?.name === "TimeoutError"
+  );
+}
+
+/** Reads Gemini's "retry in 12s" hint from a 429 error, if present. */
+function geminiRetryHintMs(err: any): number {
+  const msg = String(err?.message || "");
+  const m = msg.match(/retryDelay"?\s*:\s*"(\d+(?:\.\d+)?)s"/) || msg.match(/retry in (\d+(?:\.\d+)?)\s*s/i);
+  return m ? Math.ceil(parseFloat(m[1]) * 1000) : 0;
+}
+
+// Resilient Gemini call. "High demand" (503) and rate-limit (429) spikes often last
+// a minute or more, so we keep retrying with growing pauses and rotate through the
+// fallback models until maxWaitMs runs out. Other errors (bad key, bad request) fail fast.
+async function generateContentWithResilience(
+  ai: GoogleGenAI,
+  options: {
+    contents: any;
+    config?: any;
+    candidateModels?: string[];
+    maxWaitMs?: number;
+    /** Longest a single call may take before it is abandoned and the next model is tried */
+    perCallTimeoutMs?: number;
+  }
+) {
+  const candidateModels = options.candidateModels || [
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite",
+    // Older models as a last resort when the newer ones are overloaded (a model this key cannot use is just skipped)
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+  ];
+  const deadline = Date.now() + (options.maxWaitMs ?? 60_000);
+  const pauses = [0, 2_000, 5_000, 10_000, 20_000, 30_000, 30_000];
+
+  let lastError: any = null;
+
+  for (let round = 0; round < pauses.length; round++) {
+    if (round > 0) {
+      const hinted = geminiRetryHintMs(lastError);
+      const jitter = Math.floor(Math.random() * 1000);
+      const wait = Math.min(Math.max(pauses[round], hinted) + jitter, deadline - Date.now());
+      if (wait <= 0) break;
+      console.warn(`[gemini] Busy, retrying in ${Math.round(wait / 1000)}s (round ${round + 1})`);
+      await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+
+    let sawTransient = false;
+    for (const model of candidateModels) {
+      if (Date.now() >= deadline) break;
+      try {
+        // Hard time limit for each call: a stuck call is abandoned (and the next model
+        // tried) instead of using up the whole request's time
+        const callMs = Math.max(5_000, Math.min(deadline - Date.now(), options.perCallTimeoutMs ?? 120_000));
+        const call = (config: any) =>
+          ai.models.generateContent({
+            model,
+            contents: options.contents,
+            config: { ...config, abortSignal: AbortSignal.timeout(callMs) },
+          });
+        try {
+          return await call(options.config || {});
+        } catch (err: any) {
+          // A model that doesn't accept the thinking setting: same call without it
+          const msg = String(err?.message || "");
+          if (options.config?.thinkingConfig && (err?.status === 400 || err?.code === 400) && /think/i.test(msg)) {
+            const { thinkingConfig, ...rest } = options.config;
+            return await call(rest);
+          }
+          throw err;
+        }
+      } catch (err: any) {
+        lastError = err;
+        if (isTransientGeminiError(err)) {
+          sawTransient = true;
+          continue; // try the next model straight away
+        }
+        // A bad/blocked API key won't be fixed by another model or by waiting
+        const authProblem =
+          err?.status === 401 || err?.code === 401 || err?.status === 403 || err?.code === 403 ||
+          /API key not valid|API_KEY_INVALID|PERMISSION_DENIED|UNAUTHENTICATED/i.test(String(err?.message || ""));
+        if (authProblem) throw err;
+        // Otherwise (e.g. model not available on this key) just try the next model
+      }
+    }
+    if (!sawTransient) break; // nothing temporary left to wait out
+  }
+
+  throw lastError || new Error("Gemini request failed");
+}
+
+// Topic catalogue for IB DP Computer Science (A1-A4, B1-B4, CS) - see src/utils/ibTopics.ts
+export const IB_UNIT_CATALOGUE = IB_UNITS;
+
+// Fallback rule-based classifier
+function classifyTopicRuleBased(text: string): string {
+  return classifyIBTopic(text);
+}
+
+// API Routes
+app.get("/api/health", async (req, res) => {
+  let database: any = { enabled: isSharedStoreEnabled() };
+  if (isSharedStoreEnabled() && sharedCollections) {
+    const started = Date.now();
+    try {
+      await pullSharedState(false);
+      database = { ...database, status: "ok", ms: Date.now() - started };
+    } catch (err: any) {
+      database = {
+        ...database,
+        status: "error",
+        reason: explainDatabaseError(err),
+        detail: String(err?.message || err).slice(0, 500),
+      };
+    }
+    database.mode = process.env.FIREBASE_SERVICE_ACCOUNT ? "service-account" : "web-sdk";
+    database.databaseId = process.env.FIRESTORE_DATABASE_ID || "(from firebase-applet-config.json)";
+  }
+  res.json({
+    status: "ok",
+    hasGemini: !!process.env.GEMINI_API_KEY,
+    hasTokenSecret: !!process.env.TEACHER_TOKEN_SECRET,
+    hasTeacherPasscode: !!process.env.TEACHER_PASSCODE,
+    database,
+    totalAssessments: Object.keys(assessmentsDb).length,
+  });
+});
+
+// Convert or Generate Similar exam questions from uploaded paper + mark scheme (PDF or Image)
+// ==========================================
+// DATA FILE LIBRARY ENDPOINTS
+// ==========================================
+// Contents are readable by students on purpose: programs need them to run,
+// exactly as candidates receive the data files in the real exam.
+app.get("/api/data-files", (req, res) => {
+  const withContent = req.query.content === "1";
+  const files = Object.values(dataFilesDb)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((f) => ({
+      name: f.name,
+      size: f.content.length,
+      uploadedAt: f.uploadedAt,
+      ...(withContent ? { content: f.content } : {}),
+    }));
+  res.json({ files });
+});
+
+app.post("/api/data-files", requireTeacher, (req, res) => {
+  const incoming = Array.isArray(req.body?.files) ? req.body.files : [];
+  const saved: string[] = [];
+  const rejected: string[] = [];
+  for (const f of incoming) {
+    const name = cleanDataFileName(f?.name);
+    const content = typeof f?.content === "string" ? f.content : null;
+    if (!name || content === null || content.length > MAX_DATA_FILE_CHARS) {
+      rejected.push(String(f?.name || "(unnamed)"));
+      continue;
+    }
+    dataFilesDb[name] = { name, content, uploadedAt: Date.now() };
+    saved.push(name);
+  }
+  savePersistedDataFiles();
+  res.json({ success: true, saved, rejected });
+});
+
+app.delete("/api/data-files/:name", requireTeacher, (req, res) => {
+  const name = cleanDataFileName(req.params.name);
+  if (name && dataFilesDb[name]) {
+    delete dataFilesDb[name];
+    savePersistedDataFiles();
+  }
+  res.json({ success: true });
+});
+
+// ==========================================
+// LARGE FILE UPLOADS (sent in pieces)
+// ==========================================
+// Vercel rejects any request body larger than 4.5 MB, and a past paper PDF plus
+// its mark scheme is usually bigger than that once base64-encoded. The browser
+// therefore uploads big files in ~900 KB pieces, then sends only an uploadId.
+app.post("/api/uploads/chunk", requireTeacher, async (req, res) => {
+  try {
+    const { uploadId, index, total, data } = req.body || {};
+    if (
+      typeof uploadId !== "string" ||
+      !/^[a-zA-Z0-9_-]{8,64}$/.test(uploadId) ||
+      !Number.isInteger(index) ||
+      !Number.isInteger(total) ||
+      index < 0 ||
+      total < 1 ||
+      total > 60 ||
+      index >= total ||
+      typeof data !== "string" ||
+      data.length > 950_000
+    ) {
+      res.status(400).json({ error: "Invalid upload chunk." });
+      return;
+    }
+    await saveUploadChunk(uploadId, index, total, data);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: "Could not store upload chunk: " + (err?.message || String(err)) });
+  }
+});
+
+/** If the browser uploaded a file in pieces, reassemble it into `base64`. */
+const resolvedUploadCache = new Map<string, { base64: string; at: number }>();
+async function resolveUploadedDoc(doc: any): Promise<any> {
+  if (!doc || doc.base64 || !doc.uploadId) return doc;
+  const key = String(doc.uploadId);
+  const cached = resolvedUploadCache.get(key);
+  if (cached && Date.now() - cached.at < 30 * 60_000) return { ...doc, base64: cached.base64 };
+  const base64 = await readUpload(key, Number(doc.totalChunks) || 0);
+  // Keep at most a few papers in memory
+  if (resolvedUploadCache.size > 6) resolvedUploadCache.delete(resolvedUploadCache.keys().next().value as string);
+  resolvedUploadCache.set(key, { base64, at: Date.now() });
+  return { ...doc, base64 };
+}
+
+async function cleanupUploadedDocs(...docs: any[]) {
+  for (const d of docs) {
+    if (d && d.uploadId) {
+      resolvedUploadCache.delete(String(d.uploadId));
+      await deleteUpload(String(d.uploadId), Number(d.totalChunks) || 0);
+    }
+  }
+}
+
+app.post("/api/convert-question", requireTeacher, async (req, res) => {
+  try {
+    const {
+      questionText,
+      markScheme,
+      starterCode,
+      preferredUnit,
+      preferredType,
+      imageBase64,
+      questionDoc: rawQuestionDoc,
+      markSchemeDoc: rawMarkSchemeDoc,
+      mode = "convert", // "convert" (exact paper) or "generate_similar" (pattern-derived)
+    } = req.body;
+    const questionDoc = await resolveUploadedDoc(rawQuestionDoc);
+    const markSchemeDoc = await resolveUploadedDoc(rawMarkSchemeDoc);
+    await cleanupUploadedDocs(rawQuestionDoc, rawMarkSchemeDoc);
+
+    const hasAnyInput =
+      Boolean(questionText?.trim()) ||
+      Boolean(markScheme?.trim()) ||
+      Boolean(imageBase64) ||
+      Boolean(questionDoc?.base64) ||
+      Boolean(markSchemeDoc?.base64);
+
+    if (!hasAnyInput) {
+      res.status(400).json({
+        error: "Please provide question text, mark scheme, or upload a question / mark scheme file (PDF or Image).",
+      });
+      return;
+    }
+
+    const ai = getGeminiClient();
+
+    if (ai) {
+      try {
+        const unitsListPrompt = IB_UNIT_CATALOGUE.map(
+          (u) => `${u.code}: ${u.title} (Keywords: ${u.keywords.slice(0, 5).join(", ")})`
+        ).join("\n");
+
+        const isSimilarMode = mode === "generate_similar";
+        const similarScenario = isSimilarMode ? pickFreshScenario(String(questionText || "")) : "";
+
+        const prompt = `You are ${IB_EXAMINER_ROLE}, writing for Paper 1 (theme A: Concepts of computer science + case study) and Paper 2 (theme B: Computational thinking and problem-solving, Python).
+A teacher has provided an examination question and its markscheme (in text, image, or PDF format).
+
+MODE: ${isSimilarMode ? "GENERATE_SIMILAR_EXAM_QUESTION" : "TRANSCRIBE_EXACT_EXAM_QUESTION"}
+
+${
+  isSimilarMode
+    ? `CRITICAL DIRECTIVE FOR 'GENERATE_SIMILAR_EXAM_QUESTION':
+1. ANALYZE THE PATTERN: Identify the fundamental computational pattern, algorithmic thinking level, and data structures of the input past paper question and mark scheme (e.g., sentinel while-loop with division-by-zero protection, 2D array score filtering with file output, parallel arrays with unit-prefix conversions like 'C'/'F' or 'K'/'L', bubble sort pass tracing, simulation with conditional multipliers/boosters, or code inspection with misplaced accumulator).
+2. DO NOT MERELY SWAP TRIVIAL VALUES: Do not simply change 'Cairo' to 'Paris' or '50' to '60'. Formulate a fresh, engaging, and authentic real-world examination problem matching the exact command term, cognitive level (AO1/AO2/AO3) and syllabus scope of IB DP Computer Science (same SL/HL level as the original).
+3. DERIVE RIGOROUS TEST VALUES FROM THE PATTERN: Create thorough test cases (normal, boundary, and extreme/erroneous where relevant) with exact expected outputs and mark weightings.
+4. PRODUCE COMPLETE SOLUTION: Ensure Python 3 solutions and starters are completely valid, elegant, and syntax-correct.
+5. USE THIS NEW SCENARIO: "${similarScenario}" (not the paper's own context, and not greenhouses/solar/drones unless that is the scenario given).
+
+${BULLET_BRIEF_RULES}`
+    : `CRITICAL DIRECTIVE FOR 'TRANSCRIBE_EXACT_EXAM_QUESTION':
+1. PRESERVE THE QUESTION FIDELITY: Faithfully transcribe the question prompt, starter code, figures, and constraints from the past paper.
+2. DERIVE TEST VALUES DIRECTLY FROM MARK SCHEME: Extract the markscheme test values, boundary conditions, and expected outputs into the 'tests' array for code questions or 'questions' for theory/inspect questions.`
+}
+
+Taxonomy and Format Requirements:
+1. Determine which IB DP Computer Science topic it best fits into (use the topic code A1-A4, B1-B4 or CS):
+${unitsListPrompt}
+Paper 1 questions are A1-A4 (Section A) or CS (case study, Section B); Paper 2 questions are B1-B4. Also give the most specific syllabus reference in "specReference" (e.g. "A2.4.1" or "B2.4.3") and the IB command term in "commandWord".
+${preferredUnit ? `Note: Preferred topic: "${preferredUnit}".` : ""}
+
+2. Follow IB command terms, markscheme conventions and syllabus scope:
+${ibExaminerContext()}
+
+3. Select the best auto-markable question format ("type"):
+- "code": Student writes Python 3 code in browser. Must provide:
+    "starter": Python starter template,
+    "solution": Complete working reference Python 3 code,
+    "tests": Array of test cases: [ { "in": string[] (stdin lines), "out": string (exact stdout expected), "m": number (marks) } ]. Total test marks MUST equal "marks".
+- "mcq": Multiple choice. Must provide "questions": [ { "q": string, "options": string[], "a": number (0-based correct index) } ]. Write the wrong options as believable mistakes of the same length, detail and style as the correct one, so the correct option never stands out by being the longest or most detailed, and put the correct option at a random position.
+- "table": Trace table or classification grid. Must provide "columns": [ { "label": string, "type"?: "text"|"select", "options"?: string[] } ], and "rows": [ [ { "v": string, "g": boolean } ] ] where g:true is given/fixed, g:false is student input.
+- "inspect": Code comprehension with numbered code snippet. Must provide "code": string, and "questions": [ { "q": string, "a": string[] (all accepted variations), "why"?: string } ].
+- "theory": Free text answer. Must provide "questions": [ { "q": string, "keywords": string[], "maxMarks": number, "criteria": string[] } ].
+
+4. Programming scope: see PROGRAMMING above. If the original question prohibits a built-in function (e.g. sort, max, min), keep that restriction in the brief; otherwise automated tests must accept any correct approach.
+
+${preferredType ? `Note: Preferred type: "${preferredType}".` : ""}
+
+QUESTION CONTENT / CONTEXT:
+${questionText ? questionText : "(Refer to attached question file/image)"}
+
+MARK SCHEME / TEST CRITERIA:
+${markScheme ? markScheme : "(Refer to attached mark scheme file/image)"}
+
+${starterCode ? `STARTER CODE:\n${starterCode}\n` : ""}
+
+Reply STRICTLY with a valid JSON object only (no markdown backticks, no text outside JSON):
+{
+  "unit": "A1" | "A2" | "A3" | "A4" | "B1" | "B2" | "B3" | "B4" | "CS",
+  "unitName": "Topic title",
+  "specReference": "e.g. B2.4.3",
+  "commandWord": "IB command term, e.g. Explain",
+  "ibLevel": "SL" | "HL",
+  "markScheme": "IB-style markscheme: Award [1] for ...; Accept ...; Do not accept ... (markbands for 6+ mark Discuss/Evaluate questions)",
+  "title": "Short descriptive title (2-6 words)",
+  "level": "Starter" | "Core" | "Exam-style",
+  "marks": number,
+  "type": "code" | "mcq" | "table" | "inspect" | "theory",
+  "brief": "Full formatted question instructions and specification for student",
+  "hint": "Pedagogical hint guiding students towards the mark scheme requirement",
+  "starter": "starter Python 3 code (if type == 'code')",
+  "solution": "model Python 3 solution (if type == 'code')",
+  "tests": [ { "in": ["input1"], "out": "expected output\\n", "m": 2 } ],
+  "questions": [ ... ],
+  "columns": [ ... ],
+  "rows": [ ... ],
+  "code": "code snippet (if type == 'inspect')"
+}`;
+
+        const parts: any[] = [];
+
+        // Helper to extract base64 data and mimeType
+        const appendInlineDoc = (docBase64: string, fallbackMime = "application/pdf", label = "Document") => {
+          const match = docBase64.match(/^data:([a-zA-Z0-9.+/-]+);base64,(.*)$/);
+          const mimeType = match ? match[1] : fallbackMime;
+          const data = match ? match[2] : docBase64;
+          parts.push({
+            inlineData: { mimeType, data },
+          });
+          parts.push({ text: `[Attached ${label} (${mimeType})]` });
+        };
+
+        if (questionDoc?.base64) {
+          appendInlineDoc(questionDoc.base64, questionDoc.mimeType || "application/pdf", "Question Paper");
+        }
+        if (markSchemeDoc?.base64) {
+          appendInlineDoc(markSchemeDoc.base64, markSchemeDoc.mimeType || "application/pdf", "Mark Scheme");
+        }
+        if (imageBase64) {
+          appendInlineDoc(imageBase64, "image/png", "Question / Mark Scheme Image");
+        }
+
+        parts.push({ text: prompt });
+
+        const response = await generateContentWithResilience(ai, {
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        const rawText = response.text?.trim() || "";
+        const cleanJson = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(cleanJson);
+
+        // Sanitize and ensure valid fields
+        parsed.id = "c_" + Date.now().toString(36) + Math.random().toString(36).substring(2, 6);
+        if (!parsed.unit || !IB_UNIT_CATALOGUE.find((u) => u.code === parsed.unit)) {
+          parsed.unit = classifyTopicRuleBased((questionText || "") + " " + (markScheme || ""));
+        }
+        const unitObj = IB_UNIT_CATALOGUE.find((u) => u.code === parsed.unit);
+        parsed.unitName = ibUnitTitle(parsed.unit);
+        if (parsed.ibLevel !== "HL") parsed.ibLevel = "SL";
+        parsed.custom = true;
+        parsed.createdAt = Date.now();
+        parsed.generationMode = mode;
+        if (isSimilarMode) {
+          parsed.brief = formatBriefAsBullets(parsed.brief);
+          parsed.scenario = similarScenario;
+        }
+
+        customQuestionsDb[parsed.id] = parsed;
+        savePersistedQuestions();
+        res.json({ success: true, task: parsed, method: "gemini" });
+        return;
+      } catch (aiErr) {
+        console.error("Gemini conversion error, falling back to rule-based:", aiErr);
+      }
+    }
+
+    // Rule-based fallback if Gemini API is unavailable
+    const detectedUnit = isIBUnitCode(preferredUnit) ? preferredUnit : classifyTopicRuleBased((questionText || "") + " " + (markScheme || ""));
+    const unitObj = IB_UNIT_CATALOGUE.find((u) => u.code === detectedUnit) || IB_UNIT_CATALOGUE.find((u) => u.code === "B2")!;
+
+    let taskType: "code" | "mcq" | "table" | "inspect" | "theory" = preferredType || "inspect";
+    if (!preferredType) {
+      if ((questionText || "").toLowerCase().includes("def ") || (questionText || "").toLowerCase().includes("write a program") || starterCode) {
+        taskType = "code";
+      } else if ((markScheme || "").toLowerCase().includes("options") || (questionText || "").toLowerCase().includes("which one")) {
+        taskType = "mcq";
+      } else if ((questionText || "").toLowerCase().includes("trace table") || (questionText || "").toLowerCase().includes("complete the table")) {
+        taskType = "table";
+      } else if ((markScheme || "").toLowerCase().includes("mark per bullet") || (questionText || "").toLowerCase().includes("explain")) {
+        taskType = "theory";
+      }
+    }
+
+    const fallbackTask: any = {
+      id: "c_" + Date.now().toString(36) + Math.random().toString(36).substring(2, 6),
+      unit: unitObj.code,
+      unitName: ibUnitTitle(unitObj.code),
+      ibLevel: "SL",
+      title: (questionText || "Custom Question").split("\n")[0].slice(0, 40) || "Uploaded Question",
+      level: "Exam-style",
+      marks: 4,
+      type: taskType,
+      brief: questionText || "Answer the question based on the mark scheme.",
+      hint: "Read the requirements carefully.",
+      custom: true,
+      createdAt: Date.now(),
+    };
+
+    if (taskType === "code") {
+      fallbackTask.starter = starterCode || "# Write your Python 3 solution here\n";
+      fallbackTask.solution = starterCode || "# Reference answer\n";
+      fallbackTask.tests = [
+        { in: ["10"], out: "10\n", m: 2 },
+        { in: ["20"], out: "20\n", m: 2 },
+      ];
+    } else if (taskType === "mcq") {
+      fallbackTask.questions = [
+        {
+          q: questionText || "Select the correct option according to the mark scheme:",
+          options: ["Option A", "Option B", "Option C", "Option D"],
+          a: 0,
+        },
+      ];
+      fallbackTask.marks = 1;
+    } else if (taskType === "table") {
+      fallbackTask.columns = [{ label: "Input", type: "text" }, { label: "Output", type: "text" }];
+      fallbackTask.rows = [
+        [{ v: "Sample 1", g: true }, { v: "Expected 1", g: false }],
+        [{ v: "Sample 2", g: true }, { v: "Expected 2", g: false }],
+      ];
+      fallbackTask.marks = 2;
+    } else if (taskType === "theory") {
+      fallbackTask.questions = [
+        {
+          q: questionText || "Explain the concept described.",
+          keywords: (markScheme || "algorithm program variable").split(/[\s,]+/).filter((w: string) => w.length > 3).slice(0, 6),
+          maxMarks: 4,
+          criteria: markScheme ? [markScheme] : ["Accurate explanation of key mechanism"],
+        },
+      ];
+    } else {
+      fallbackTask.questions = [
+        {
+          q: "What is the expected outcome?",
+          a: [(markScheme || "Answer").trim()],
+          why: markScheme || "Matches exam specification",
+        },
+      ];
+      fallbackTask.marks = 1;
+    }
+
+    customQuestionsDb[fallbackTask.id] = fallbackTask;
+    res.json({ success: true, task: fallbackTask, method: "rule-based" });
+  } catch (error: any) {
+    console.error("Convert question error:", error);
+    res.status(500).json({ error: error.message || "Failed to convert question" });
+  }
+});
+
+// ---------- Fresh scenarios + bullet-point briefs for "Generate Similar" ----------
+// A different real-world context is chosen every time (recently used ones are skipped),
+// so generated questions don't keep coming back to the same theme.
+const SIMILAR_SCENARIOS: string[] = [
+  "school canteen lunch orders", "library book loans and overdue fines", "cinema ticket booking", "bus fare calculator",
+  "football league points table", "swimming gala race times", "marathon finishing times", "gym membership fees",
+  "pizza delivery orders", "coffee shop loyalty card", "online shop discount codes", "mobile phone data usage",
+  "electricity bill calculator", "car park charges", "taxi fare meter", "train seat reservations",
+  "hotel room bookings", "airport baggage weight check", "weather station rainfall records", "river flood level alerts",
+  "zoo animal feeding schedule", "pet grooming appointments", "vet clinic patient weights", "hospital waiting list",
+  "pharmacy stock levels", "blood donation records", "school attendance register", "exam grade calculator",
+  "student reading log", "spelling test scores", "music streaming playlist", "video game high-score table",
+  "esports tournament brackets", "chess club ratings", "bakery daily sales", "farmers' market stall takings",
+  "recycling centre collection weights", "water usage meter", "bike hire scheme", "electric scooter battery range",
+  "theme park ride queue times", "concert ticket sales", "charity fun-run sponsorship", "school trip payments",
+  "password strength checker", "username generator", "parcel delivery tracking", "warehouse stock reorder",
+  "restaurant table bookings", "fitness step counter", "sleep tracker hours", "plant watering reminder",
+  "aquarium water temperature", "beehive honey production", "fishing boat catch records", "ski resort snow depth",
+  "museum visitor counts", "art competition judging scores", "talent show audience votes", "school election ballot count",
+];
+const recentSimilarScenarios: string[] = [];
+
+function pickFreshScenario(avoidText: string): string {
+  const avoid = String(avoidText || "").toLowerCase();
+  // Scenarios used by recently generated questions (kept in the question bank, so this survives restarts)
+  const recentFromBank = Object.values(customQuestionsDb)
+    .filter((q: any) => q && q.scenario)
+    .sort((a: any, b: any) => (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, 25)
+    .map((q: any) => String(q.scenario));
+  const used = new Set([...recentSimilarScenarios, ...recentFromBank]);
+  const mainWord = (sc: string) => sc.split(" ").filter((w) => w.length > 3)[0] || sc;
+  let pool = SIMILAR_SCENARIOS.filter((sc) => !used.has(sc) && !avoid.includes(mainWord(sc).toLowerCase()));
+  if (!pool.length) pool = SIMILAR_SCENARIOS.filter((sc) => !avoid.includes(mainWord(sc).toLowerCase()));
+  if (!pool.length) pool = SIMILAR_SCENARIOS;
+  const picked = pool[Math.floor(Math.random() * pool.length)];
+  recentSimilarScenarios.push(picked);
+  if (recentSimilarScenarios.length > 25) recentSimilarScenarios.shift();
+  return picked;
+}
+
+const BULLET_BRIEF_RULES = `FORMAT OF "brief" (VERY IMPORTANT - students must understand it at a glance):
+- Start with ONE or TWO short sentences that set the scene.
+- Then a line such as "Write a program that:" (or "You must:" for written questions).
+- Then EACH separate task on its own line starting with "• " (bullet). One action per bullet, short and clear (e.g. "• asks the user to enter the number of tickets", "• displays the total cost to 2 decimal places").
+- Put exact prompts/outputs in quotes inside the bullet they belong to.
+- Separate lines with \\n. NEVER write the requirements as one long paragraph.`;
+
+// Safety net: if the AI still returns one long paragraph, split it into bullet points.
+function formatBriefAsBullets(brief: any): string {
+  const text = String(brief || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return text;
+  const lines = text.split("\n").filter((l) => l.trim());
+  const listLines = lines.filter((l) => /^\s*([•\-*]|\d+[.)]|\([a-z0-9]+\))\s+/.test(l));
+  if (listLines.length >= 2) {
+    // Already a list: make every list line a clear bullet.
+    return text
+      .split("\n")
+      .map((l) => l.replace(/^\s*[\-*]\s+/, "• ").replace(/^\s*\d+[.)]\s+/, "• "))
+      .join("\n");
+  }
+  const protectedText = text.replace(/\b(e\.g|i\.e|etc|vs)\./gi, (m) => m.replace(/\./g, "§"));
+  const sentences = protectedText
+    .split(/(?<=[.!?])\s+(?=[A-Z"'“(])/)
+    .map((x) => x.replace(/§/g, ".").trim())
+    .filter(Boolean);
+  if (sentences.length < 3) return text;
+  const isTask = (x: string) =>
+    /\b(must|should|need|needs|write|devise|create|ask|asks|prompt|input|enter|display|displays|output|outputs|print|calculate|store|validate|check|repeat|count|add|use|save|open|read)\b/i.test(x);
+  const firstTask = sentences.findIndex((x, i) => i > 0 && isTask(x));
+  const cut = firstTask > 0 ? Math.min(firstTask, 2) : 1;
+  const intro = sentences.slice(0, cut).join(" ");
+  const tasks = sentences.slice(cut).map((x) => "• " + x.replace(/^(and|then)\s+/i, ""));
+  return `${intro}\n\nYou need to:\n${tasks.join("\n")}`;
+}
+
+
+
+// ---------- Quality checks for "Generate Similar" ----------
+// 1. Relevance: the new question must test the same skills as the original.
+// 2. Code questions: the model answer is RUN on every test; expected outputs come from that
+//    run (never from the AI's guess), and a crashing/weak answer is sent back for a retry.
+// 3. A second AI "examiner" reviews the question, answer key and mark scheme.
+
+const NO_PROMPT_PRELUDE = 'import builtins as _b\n_real_input = _b.input\ndef input(prompt=""):\n    return _real_input()\n';
+
+function detectSkills(task: any): string[] {
+  const code = `${task?.solution || ""}\n${task?.starter || ""}`;
+  const text = `${task?.title || ""}\n${task?.brief || ""}`.toLowerCase();
+  const has = (re: RegExp) => re.test(code);
+  const skills: string[] = [];
+  if (has(/\binput\s*\(/)) skills.push("reading user input with input() and converting types");
+  if (has(/\bfor\s+\w+\s+in\s+range/)) skills.push("count-controlled for loop with range()");
+  else if (has(/\bfor\s+\w+\s+in\b/)) skills.push("for loop over a list/string");
+  if (has(/\bwhile\b/)) skills.push(/!=\s*-?\d|sentinel/i.test(code + text) ? "while loop with a sentinel value" : "condition-controlled while loop (e.g. validation)");
+  if (has(/\belif\b/)) skills.push("if / elif / else selection");
+  else if (has(/\bif\b/)) skills.push("if / else selection");
+  if (has(/\band\b|\bor\b/)) skills.push("compound conditions with and/or");
+  if (has(/\[\s*\[/)) skills.push("a two-dimensional list (table) with nested indexing");
+  else if (has(/=\s*\[[^\]]*,/)) skills.push("a one-dimensional list (array)");
+  if (/parallel/i.test(text) || (code.match(/^\s*\w+\s*=\s*\[[^\[]/gm) || []).length >= 2) skills.push("parallel lists that share an index");
+  if (has(/\.append\(/)) skills.push("appending to a list");
+  if (has(/\[\s*-?\d*\s*:\s*-?\d*\s*\]/)) skills.push("string/list slicing");
+  if (has(/\bopen\s*\(/)) skills.push(/["']w["']|["']a["']/.test(code) ? "writing to a text file" : "reading from a text file");
+  if (has(/\.split\(/)) skills.push("splitting lines with split()");
+  if (has(/\bdef\b/)) skills.push(has(/\breturn\b/) ? "a function with parameters and a return value" : "a procedure (subprogram) with parameters");
+  if (has(/%\s*\d/)) skills.push("modulus (%)");
+  if (has(/\/\/\s*\d/)) skills.push("integer division (//)");
+  if (has(/round\(|:\.\d+f|format\(/)) skills.push("formatting numbers (rounding / decimal places)");
+  if (/highest|lowest|maximum|minimum|largest|smallest/.test(text)) skills.push("finding the highest/lowest value with a loop");
+  if (/total|sum|average|mean/.test(text)) skills.push("running total / average");
+  if (/search/.test(text)) skills.push("searching");
+  if (/sort/.test(text)) skills.push("sorting");
+  return Array.from(new Set(skills));
+}
+
+function parseJsonLoose(raw: string): any {
+  const clean = String(raw || "").replace(/```json/gi, "").replace(/```/g, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch {
+    const a = clean.indexOf("{");
+    const b = clean.lastIndexOf("}");
+    if (a >= 0 && b > a) return JSON.parse(clean.slice(a, b + 1));
+    throw new Error("Not valid JSON");
+  }
+}
+
+function normaliseGenerated(t: any, marks: number): any {
+  const out = { ...t };
+  out.marks = Number(out.marks) || marks;
+  if (Array.isArray(out.tests)) {
+    out.tests = out.tests
+      .filter((x: any) => x && typeof x === "object")
+      .map((x: any) => ({
+        in: (Array.isArray(x.in) ? x.in : x.in === undefined || x.in === null || x.in === "" ? [] : [x.in]).map((v: any) => String(v)),
+        out: String(x.out ?? ""),
+        m: Number(x.m) || 0,
+      }));
+  }
+  if (Array.isArray(out.markPoints)) {
+    out.markPoints = out.markPoints
+      .filter((m: any) => m && (m.criterion || m.description || m.point))
+      .map((m: any, i: number) => ({
+        id: String(m.id || `MP${i + 1}`),
+        marks: Math.max(1, Number(m.marks) || 1),
+        criterion: String(m.criterion || m.description || m.point),
+      }));
+  }
+  return out;
+}
+
+function spreadTestMarks(t: any) {
+  if (!Array.isArray(t.tests) || !t.tests.length) return;
+  const sum = t.tests.reduce((a: number, x: any) => a + (Number(x.m) || 0), 0);
+  if (sum === t.marks) return;
+  const base = Math.max(1, Math.floor(t.marks / t.tests.length));
+  let rem = t.marks;
+  t.tests.forEach((x: any, i: number) => {
+    x.m = i === t.tests.length - 1 ? Math.max(1, rem) : base;
+    rem -= base;
+  });
+}
+
+async function verifyCodeTask(t: any, recheck = false): Promise<{ ok: boolean; problems: string[]; notes: string[]; ran: boolean }> {
+  const problems: string[] = [];
+  const notes: string[] = [];
+  if (!String(t.solution || "").trim()) return { ok: false, problems: ["There is no model solution."], notes, ran: false };
+  if (!Array.isArray(t.tests) || t.tests.length < 2) problems.push("Provide at least 3 test cases (normal, boundary and extreme) with different inputs.");
+  if (problems.length) return { ok: false, problems, notes, ran: false };
+
+  const files = getFilesForTask(t);
+  const results = await runPythonTests(NO_PROMPT_PRELUDE + t.solution, t.tests.map((x: any) => x.in), files);
+  if (!results) {
+    notes.push("⚠️ Python could not be run on the server just now, so the expected outputs are the AI's own - please check them.");
+    return { ok: true, problems, notes, ran: false };
+  }
+  let corrected = 0;
+  results.forEach((r, i) => {
+    const test = t.tests[i];
+    if (r.err) {
+      const line = String(r.err).trim().split("\n").filter(Boolean).pop() || "error";
+      problems.push(`The model solution crashes on test ${i + 1} (inputs ${JSON.stringify(test.in)}): ${line.slice(0, 200)}`);
+      return;
+    }
+    const actual = normalizeOutput(r.out);
+    if (!actual) {
+      problems.push(`The model solution prints nothing for test ${i + 1}.`);
+      return;
+    }
+    if (normalizeOutput(test.out) !== actual) corrected++;
+    test.out = actual;
+  });
+  if (!problems.length) {
+    const distinct = new Set(t.tests.map((x: any) => x.out)).size;
+    const distinctIn = new Set(t.tests.map((x: any) => JSON.stringify(x.in))).size;
+    if (t.tests.length >= 2 && distinctIn > 1 && distinct === 1)
+      problems.push("Every test gives the same output, so the tests cannot tell a right program from a wrong one. Use inputs that lead to different results (normal, boundary, extreme).");
+  }
+  // The starter on its own must not already pass the tests
+  if (!problems.length && String(t.starter || "").trim()) {
+    const sr = await runPythonTests(NO_PROMPT_PRELUDE + t.starter, t.tests.map((x: any) => x.in), files);
+    if (sr && sr.every((r, i) => !r.err && normalizeOutput(r.out) === t.tests[i].out)) problems.push("The starter code already passes all the tests - it must not contain the answer.");
+  }
+  if (!problems.length) {
+    notes.push(`✓ Model answer run on all ${t.tests.length} tests - expected outputs come from running it.`);
+    if (corrected)
+      notes.push(
+        recheck
+          ? `✓ ${corrected} expected output${corrected > 1 ? "s were" : " was"} updated from your model answer.`
+          : `✓ ${corrected} expected output${corrected > 1 ? "s were" : " was"} wrong in the AI draft and ${corrected > 1 ? "have" : "has"} been corrected.`
+      );
+  }
+  return { ok: problems.length === 0, problems, notes, ran: true };
+}
+
+function checkNonCodeTask(t: any): { ok: boolean; problems: string[] } {
+  const problems: string[] = [];
+  if (!String(t.brief || "").trim()) problems.push("The question has no brief.");
+  if (t.type === "mcq") {
+    const qs = Array.isArray(t.questions) ? t.questions : [];
+    if (!qs.length) problems.push("An MCQ needs at least one question with options.");
+    qs.forEach((q: any, i: number) => {
+      const opts = Array.isArray(q.options) ? q.options.map((o: any) => String(o).trim()) : [];
+      if (opts.length < 2) problems.push(`MCQ ${i + 1} needs at least 2 options.`);
+      if (new Set(opts.map((o: string) => o.toLowerCase())).size !== opts.length) problems.push(`MCQ ${i + 1} has duplicate options.`);
+      const a = Number(q.a);
+      if (!(a >= 0 && a < opts.length)) problems.push(`MCQ ${i + 1} answer index is not one of its options.`);
+    });
+  }
+  if (t.type === "table") {
+    const rows = Array.isArray(t.rows) ? t.rows : [];
+    if (!rows.length || !Array.isArray(t.columns) || !t.columns.length) problems.push("The trace table needs columns and rows.");
+  }
+  if (t.type === "inspect" && !(Array.isArray(t.questions) && t.questions.length)) problems.push("The inspection question needs sub-questions with accepted answers.");
+  const msSum = Array.isArray(t.markPoints) ? t.markPoints.reduce((a: number, m: any) => a + (Number(m.marks) || 0), 0) : 0;
+  if (!msSum && !String(t.markScheme || "").trim() && t.type !== "mcq") problems.push("There is no mark scheme.");
+  return { ok: problems.length === 0, problems };
+}
+
+async function reviewGeneratedTask(ai: any, source: any, cand: any, skills: string[], budgetMs = 60_000): Promise<{ task: any; notes: string[] }> {
+  if (budgetMs < 20_000) return { task: cand, notes: ["⚠️ The second examiner review was skipped to save time - please read the question carefully."] };
+  const prompt = `You are a second, independent IB Diploma Programme Computer Science examiner (first assessment 2027).
+A colleague wrote a NEW question based on an ORIGINAL one. Check it carefully and FIX anything wrong.
+
+Check:
+1. RELEVANCE - it must test the same skills as the original: ${skills.length ? skills.join("; ") : "the same topic and skills"}. Same question type ("${cand.type}") and ${cand.marks} marks. A different scenario is expected and fine.
+2. ANSWER KEY - every correct answer, MCQ answer index ("a", 0-based), accepted answer and trace-table value must be right.
+3. MARKSCHEME - each mark point must be something a candidate can actually do from the brief, written IB-style ("Award [1] for ..."); the mark points must add up to exactly ${cand.marks}. The depth expected must match the IB command term (${cand.commandWord || "see brief"}); 6+ mark Discuss/Evaluate/To what extent questions use levels-based markbands.
+4. BRIEF - every requirement the solution/mark scheme relies on must be stated in the brief, including the EXACT output wording and formats (spaces, punctuation, decimal places) that the model solution prints. Keep bullet points.
+5. CODE (if any) - the solution must be valid Python 3 that meets the brief; it must only use content in the IB DP Computer Science syllabus (${cand.ibLevel === "HL" ? "SL and HL" : "SL only - no recursion, multiple-class OOP or B4 ADTs"}); any prohibited built-in functions must be stated in the brief and not used in the solution; the starter must not contain the answer; test inputs must cover normal, boundary and extreme/erroneous cases.
+6. SCOPE - the question must stay inside the IB syllabus for its level (${cand.ibLevel === "HL" ? "HL" : "SL"}).
+
+Return ONLY the corrected question as a JSON object with exactly the same fields as the input, plus "reviewNotes": an array of short sentences saying what you changed (empty array if nothing needed changing).
+
+ORIGINAL QUESTION:
+${JSON.stringify({ title: source.title, type: source.type, marks: source.marks, brief: source.brief, starter: source.starter, solution: source.solution, markScheme: source.markScheme, markPoints: source.markPoints, questions: source.questions }, null, 1).slice(0, 12000)}
+
+NEW QUESTION TO CHECK:
+${JSON.stringify(cand, null, 1).slice(0, 14000)}`;
+  try {
+    const r = await generateContentWithResilience(ai, {
+      contents: { parts: [{ text: prompt }] },
+      config: { responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "LOW" } },
+      maxWaitMs: Math.min(60_000, budgetMs),
+      perCallTimeoutMs: Math.min(55_000, budgetMs),
+    });
+    const reviewed = parseJsonLoose(r.text || "");
+    if (!reviewed || typeof reviewed !== "object" || !reviewed.brief) return { task: cand, notes: [] };
+    const notes = (Array.isArray(reviewed.reviewNotes) ? reviewed.reviewNotes : []).map((n: any) => "Reviewer: " + String(n)).slice(0, 6);
+    delete reviewed.reviewNotes;
+    // Never let the review change what kind of question it is
+    reviewed.type = cand.type;
+    return { task: { ...cand, ...reviewed }, notes: notes.length ? notes : ["✓ Second examiner review: no changes needed."] };
+  } catch (e) {
+    return { task: cand, notes: ["⚠️ The second examiner review could not run this time."] };
+  }
+}
+
+
+// ==========================================
+// AI-POWERED SIMILAR QUESTION GENERATOR (IB DP COMPUTER SCIENCE)
+// Uses Gemini API to create authentic variations of existing tasks in the question bank
+// ==========================================
+// Re-run a (possibly edited) model solution on its tests and return corrected expected outputs
+app.post("/api/generate-similar-question/verify", requireTeacher, async (req, res) => {
+  const t = normaliseGenerated(req.body?.task || {}, Number(req.body?.task?.marks) || 1);
+  if (t.type !== "code") {
+    const v = checkNonCodeTask(t);
+    res.json({ task: t, ok: v.ok, notes: v.ok ? ["✓ Structure checked."] : v.problems });
+    return;
+  }
+  const v = await verifyCodeTask(t, true);
+  if (v.ok) spreadTestMarks(t);
+  res.json({ task: t, ok: v.ok, notes: v.ok ? v.notes : v.problems });
+});
+
+app.post("/api/generate-similar-question", requireTeacher, async (req, res) => {
+  try {
+    const {
+      sourceTask,
+      variationMode = "parallel", // "parallel" | "easier" | "harder" | "code_to_trace" | "code_to_inspect"
+      targetMarks: reqMarks,
+      customInstruction,
+      preferredDifficulty,
+    } = req.body;
+
+    if (!sourceTask || !sourceTask.title) {
+      res.status(400).json({ error: "A valid source task from the question bank is required." });
+      return;
+    }
+
+    const currentMarks = Number(sourceTask.marks) || 3;
+    let targetMarks = reqMarks ? Number(reqMarks) : currentMarks;
+    if (!reqMarks) {
+      if (variationMode === "easier") targetMarks = Math.max(1, currentMarks - 1);
+      if (variationMode === "harder") targetMarks = currentMarks + 2;
+    }
+
+    const srcUnit = ensureIBUnit(sourceTask).unit as string;
+    const unitInfo = IB_UNIT_CATALOGUE.find((u) => u.code === srcUnit) || IB_UNIT_CATALOGUE.find((u) => u.code === "B2")!;
+    const sourceLevel: "SL" | "HL" = sourceTask.ibLevel === "HL" ? "HL" : "SL";
+
+    const ai = getGeminiClient();
+
+    if (ai) {
+      try {
+        const variationDirectives: Record<string, string> = {
+          parallel: `Create a PARALLEL authentic examination task with the EXACT same cognitive depth and mark weighting (${targetMarks} marks).
+- Identify the core computational pattern (e.g. sentinel while-loop, list traversal, 2D lookup, accumulator with threshold, validation).
+- Transfer it into the FRESH real-world scenario given below (SCENARIO TO USE).
+- Do NOT merely change trivial variable names (e.g. 'cat' to 'dog'). Invent an authentic problem scenario with clear user prompts and formatted output specifications.`,
+          easier: `Create a FOUNDATIONAL / SCAFFOLDED variant targeted for reinforcement (${targetMarks} marks).
+- Simplify complex nested branching or multi-condition requirements into a clear, direct requirement.
+- Provide descriptive scaffold guidance in the starter code with helpful comment cues.
+- Stay within the IB DP Computer Science syllabus (same SL/HL level) while building candidate confidence.`,
+          harder: `Create a HIGHER-TIER / CHALLENGING EXTENSION variant (${targetMarks} marks).
+- Introduce boundary checks, robust validation (e.g. ensuring input is within specified range or re-prompting on invalid entry), compound conditions, or edge case handling.
+- Require professional code structure, defensive programming (try/except where relevant), and formatted numeric display (e.g. two decimal places or percentage output).
+- For theory questions, move up the command-term ladder (e.g. Describe -> Explain -> Evaluate) and use IB markbands when the question is worth 6+ marks.`,
+          code_to_trace: `Transform this programming task into an IB PAPER 2 TRACE TABLE QUESTION (${targetMarks} marks, command term "Trace").
+- Present a numbered algorithm or Python snippet derived from this problem.
+- Provide trace table columns (Line, key variables, conditions, Output).
+- Students dry-run the provided test data through the logic step-by-step.`,
+          code_to_inspect: `Transform this programming task into an IB PAPER 2 CODE INSPECTION & DEBUGGING QUESTION (${targetMarks} marks, B2.1.4 debugging).
+- Provide a short, numbered Python snippet with an intentional deliberate bug (syntax, runtime, or logic error) or key architectural feature.
+- Ask sub-questions using IB command terms: State/Identify line numbers, Identify error types, Outline or Explain the purpose of variables/parameters.`,
+        };
+
+        const targetType =
+          variationMode === "code_to_trace"
+            ? "table"
+            : variationMode === "code_to_inspect"
+            ? "inspect"
+            : sourceTask.type || "code";
+
+        const scenario = pickFreshScenario(`${sourceTask.title} ${sourceTask.brief}`);
+        (req as any).similarScenario = scenario;
+        const prompt = `You are ${IB_EXAMINER_ROLE}.
+
+Your task is to generate a new, authentic, high-quality IB examination question derived from an existing question bank item.
+
+SCENARIO TO USE: "${scenario}".
+${customInstruction ? "If the teacher directive below names a different theme, use the teacher's theme instead." : ""}
+Do NOT reuse the scenario of the original question, and do NOT use greenhouses, solar panels, drones or sensors unless the scenario above or the teacher asks for it.
+
+==================================================
+IB DP COMPUTER SCIENCE CONTEXT:
+- Topic: ${unitInfo.code} - ${unitInfo.title} (${unitInfo.paper}; syllabus refs: ${unitInfo.spec})
+- Level: ${sourceLevel}${sourceLevel === "SL" ? " (use SL content only - no HL-only learning outcomes)" : " (HL-only content allowed)"}
+- Target Marks: ${targetMarks}
+- Target Question Type: ${targetType}
+- Target Difficulty: ${preferredDifficulty || (variationMode === "easier" ? "Easy" : variationMode === "harder" ? "Hard" : "Moderate")}
+- Variation Directive:
+${variationDirectives[variationMode] || variationDirectives.parallel}
+${customInstruction ? `\nTEACHER CUSTOM DIRECTIVE / THEME INSTRUCTION:\n"${customInstruction}"\n` : ""}
+
+==================================================
+ORIGINAL SOURCE QUESTION FROM QUESTION BANK:
+- Title: ${sourceTask.title}
+- Brief / Statement: ${sourceTask.brief}
+- Original Marks: ${sourceTask.marks}
+- Original Level: ${sourceTask.level}
+- Original Type: ${sourceTask.type}
+${sourceTask.commandWord ? `- Original command term: ${sourceTask.commandWord}\n` : ""}${sourceTask.specReference ? `- Original syllabus reference: ${sourceTask.specReference}\n` : ""}${sourceTask.starter ? `Original Starter Code:\n${sourceTask.starter}\n` : ""}
+${sourceTask.solution ? `Original Reference Solution:\n${sourceTask.solution}\n` : ""}
+${sourceTask.tests && sourceTask.tests.length > 0 ? `Original Test Cases:\n${JSON.stringify(sourceTask.tests, null, 2)}\n` : ""}
+${sourceTask.questions && sourceTask.questions.length > 0 ? `Original Sub-Questions:\n${JSON.stringify(sourceTask.questions, null, 2)}\n` : ""}
+${sourceTask.markScheme ? `Original Markscheme:\n${String(sourceTask.markScheme).slice(0, 3000)}\n` : ""}
+
+==================================================
+IB EXAMINATION REQUIREMENTS:
+${ibExaminerContext({ level: sourceLevel })}
+
+QUESTION-WRITING RULES:
+1. Use the same IB command term as the original (or the next step up for "harder"), and make the depth of the expected answer match the command term and the marks.
+2. Python 3 standards for 'code' questions:
+   - All input is captured with input(); type conversions (int(), float()) are explicit.
+   - Starter code begins with a short header comment (# Question <Number> / # Complete the program below) and must not contain the answer.
+   - Solution must be 100% valid Python 3, PEP-8 style, and use only the standard library.
+   - If the original prohibits a built-in function (e.g. sort, max, min), keep that restriction and state it in the brief.
+   - Test cases MUST include normal, boundary and extreme/erroneous cases. The sum of all test marks ("m") MUST EXACTLY EQUAL ${targetMarks}.
+3. Markscheme: give structured "markPoints" (MP1, MP2, ...) whose criteria follow IB wording ("Award [1] for ..."), and a "markScheme" text with Accept / Do not accept notes. For Discuss / Evaluate / To what extent questions worth 6+ marks, write the markScheme as IB markbands instead of point marks.
+
+==================================================
+${BULLET_BRIEF_RULES}
+
+==================================================
+OUTPUT FORMAT:
+Reply with ONLY a valid, raw JSON object (no markdown quotes, no text before or after):
+{
+  "unit": "${unitInfo.code}",
+  "unitName": "${unitInfo.title}",
+  "title": "Short title (3-6 words)",
+  "level": "${variationMode === "easier" ? "Core" : variationMode === "harder" ? "Extension" : "Exam-style"}",
+  "difficulty": "${preferredDifficulty || (variationMode === "easier" ? "Easy" : variationMode === "harder" ? "Hard" : "Moderate")}",
+  "type": "${targetType}",
+  "marks": ${targetMarks},
+  "commandWord": "IB command term, e.g. Construct | Explain | Trace | Evaluate | Outline | State",
+  "specReference": "Most specific IB syllabus reference, e.g. ${unitInfo.code === "CS" ? "CS" : unitInfo.code + ".1.1"}",
+  "ibLevel": "${sourceLevel}",
+  "markScheme": "IB-style markscheme text (Award [1] for ...; Accept ...; Do not accept ...)",
+  "brief": "Short scene-setting sentence(s)\\nWrite a program that:\\n• first task\\n• second task",
+  "hint": "Pedagogical hint guiding students towards mark scheme requirements",
+  "starter": "Starter Python 3 scaffold with candidate header",
+  "solution": "Complete working Python 3 reference solution",
+  "starterFileName": "Q01_similar.py",
+  "tests": [
+    { "in": ["input_line_1", "input_line_2"], "out": "exact expected output\\n", "m": number }
+  ],
+  "markPoints": [
+    { "id": "MP1", "marks": 1, "criterion": "Award [1] for ..." }
+  ],
+  "questions": [ ... for mcq, inspect, or theory ... ],
+  "columns": [ ... for table ... ],
+  "rows": [ ... for table ... ]
+}`;
+
+        // ---- Generate, review and verify (one retry with the problems explained) ----
+        const skills = detectSkills(sourceTask);
+        const relevanceBlock = `
+
+==================================================
+RELEVANCE (MOST IMPORTANT):
+The new question MUST test the same skills as the original${skills.length ? ":\n- " + skills.join("\n- ") : "."}
+- Same question type ("${targetType}") and exactly ${targetMarks} marks.
+- Only the scenario, names and values change - not the skills being tested.
+- The brief must state the EXACT output wording your solution prints.
+- Mark points ("markPoints") must add up to exactly ${targetMarks}.
+${targetType === "code" ? "- Provide 3 or 4 tests with DIFFERENT inputs that lead to DIFFERENT outputs (normal, boundary, extreme). Inputs are the exact lines typed by the user, in order." : ""}`;
+        const verificationNotes: string[] = [];
+        let parsed: any = null;
+        let lastProblems: string[] = [];
+        let lastError: any = null;
+        // Vercel stops a request after 300 s, so everything must finish well inside that
+        const started = Date.now();
+        const timeLeft = () => 270_000 - (Date.now() - started);
+        for (let attempt = 1; attempt <= 3 && !parsed; attempt++) {
+          if (attempt > 1 && timeLeft() < 100_000) break;
+          const retryBlock = lastProblems.length
+            ? `\n\nYOUR PREVIOUS ATTEMPT WAS REJECTED FOR THESE REASONS - FIX THEM:\n- ${lastProblems.join("\n- ")}`
+            : "";
+          let response: any;
+          try {
+            response = await generateContentWithResilience(ai, {
+              contents: { parts: [{ text: prompt + relevanceBlock + retryBlock }] },
+              config: { responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "LOW" } },
+              maxWaitMs: Math.max(30_000, Math.min(150_000, timeLeft() - 40_000)),
+              perCallTimeoutMs: 120_000,
+            });
+          } catch (genErr: any) {
+            // A slow or busy model: try again while there is time (unless the key itself is the problem)
+            lastError = genErr;
+            console.warn(`Generate similar attempt ${attempt} failed:`, String(genErr?.message || genErr).slice(0, 300));
+            if (/API key|API_KEY|PERMISSION_DENIED|UNAUTHENTICATED/i.test(String(genErr?.message || ""))) break;
+            continue;
+          }
+          lastError = null;
+          let cand: any;
+          try {
+            cand = normaliseGenerated(parseJsonLoose(response.text || ""), targetMarks);
+          } catch {
+            lastProblems = ["The reply was not valid JSON."];
+            continue;
+          }
+          if (cand.type !== targetType) {
+            lastProblems = [`The question type must be "${targetType}", not "${cand.type}".`];
+            continue;
+          }
+          const reviewed = await reviewGeneratedTask(ai, sourceTask, cand, skills, timeLeft() - 45_000);
+          cand = normaliseGenerated(reviewed.task, targetMarks);
+          if (cand.type === "code") {
+            const v = await verifyCodeTask(cand);
+            if (!v.ok) {
+              lastProblems = v.problems;
+              verificationNotes.push(`Attempt ${attempt} rejected: ${v.problems[0]}`);
+              continue;
+            }
+            spreadTestMarks(cand);
+            verificationNotes.push(...v.notes, ...reviewed.notes);
+          } else {
+            const v = checkNonCodeTask(cand);
+            if (!v.ok) {
+              lastProblems = v.problems;
+              verificationNotes.push(`Attempt ${attempt} rejected: ${v.problems[0]}`);
+              continue;
+            }
+            verificationNotes.push("✓ Answer key and mark scheme structure checked.", ...reviewed.notes);
+          }
+          const mpSum = Array.isArray(cand.markPoints) ? cand.markPoints.reduce((a: number, m: any) => a + (Number(m.marks) || 0), 0) : 0;
+          if (mpSum && mpSum !== cand.marks) verificationNotes.push(`⚠️ The mark points add up to ${mpSum}, not ${cand.marks} - please check the mark scheme.`);
+          if (skills.length) verificationNotes.push(`Skills kept from the original: ${skills.slice(0, 6).join(", ")}.`);
+          parsed = cand;
+        }
+        if (!parsed && lastError && !lastProblems.length) {
+          res.status(503).json({
+            error: /503|UNAVAILABLE|high demand|overloaded|429|RESOURCE_EXHAUSTED/i.test(String(lastError?.message || lastError))
+              ? "Google's Gemini AI service is overloaded right now (this is on Google's side, not a problem with your app). The server kept retrying for a few minutes. Please try again in 10-15 minutes."
+              : "The AI did not reply in time. Please wait a minute and click Generate again.",
+            detail: String(lastError?.message || lastError).slice(0, 300),
+          });
+          return;
+        }
+        if (!parsed) {
+          res.status(422).json({
+            error: "The AI could not write a question that passed the quality checks this time. Please click Generate again.",
+            problems: lastProblems,
+          });
+          return;
+        }
+
+        parsed.id = `c_sim_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+        parsed.brief = formatBriefAsBullets(parsed.brief);
+        parsed.scenario = customInstruction ? undefined : (req as any).similarScenario;
+        parsed.unit = isIBUnitCode(parsed.unit) ? parsed.unit : unitInfo.code;
+        parsed.unitName = ibUnitTitle(parsed.unit);
+        parsed.ibLevel = parsed.ibLevel === "HL" || sourceLevel === "HL" ? "HL" : "SL";
+        parsed.marks = Number(parsed.marks) || targetMarks;
+        parsed.custom = true;
+        parsed.isSimilar = true;
+        parsed.generationMode = "generate_similar";
+        parsed.variationMode = variationMode;
+        parsed.parentTaskId = sourceTask.id;
+        parsed.modelUsed = "gemini-3.8-flash";
+        parsed.createdAt = Date.now();
+        const teacherProfile = (req as any).teacher;
+        if (teacherProfile?.name) {
+          parsed.authorName = teacherProfile.name;
+          parsed.authorSchool = teacherProfile.school || IB_SCHOOL;
+        }
+
+        if (parsed.type === "code") {
+          parsed.starterFileName = parsed.starterFileName || (sourceTask.starterFileName ? `sim_${sourceTask.starterFileName}` : "task_variant.py");
+        }
+        parsed.verificationNotes = verificationNotes;
+
+        // Not saved here: the teacher reviews it first and saves it with "Save to Bank"
+        res.json({ success: true, task: parsed, method: "gemini", verification: verificationNotes });
+        return;
+      } catch (geminiErr: any) {
+        console.warn("Generate similar failed:", geminiErr);
+        res.status(503).json({
+          error: "The AI is busy or could not be reached. Please wait a moment and click Generate again.",
+          detail: String(geminiErr?.message || geminiErr).slice(0, 300),
+        });
+        return;
+      }
+    }
+
+    // No AI key configured: a template question would not be relevant, so say so instead
+    if (!ai) {
+      res.status(503).json({ error: "Generate Similar needs the Gemini API key to be set up on the server." });
+      return;
+    }
+
+    // Deterministic syllabus-grounded IB DP Computer Science fallback
+    const fallbackSimId = `c_sim_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+    const fallbackScenario = pickFreshScenario(`${sourceTask.title} ${sourceTask.brief}`);
+    const niceScenario = fallbackScenario.replace(/\b\w/g, (c: string) => c.toUpperCase());
+    const picked = { domain: niceScenario, item: "values", validMsg: "Total accepted:", outputFlag: "Limit exceeded:" };
+
+    const fallbackTask: any = {
+      id: fallbackSimId,
+      unit: unitInfo.code,
+      unitName: ibUnitTitle(unitInfo.code),
+      ibLevel: sourceLevel,
+      title: `${sourceTask.title} (variant: ${picked.domain})`,
+      level: variationMode === "easier" ? "Core" : variationMode === "harder" ? "Extension" : "Exam-style",
+      difficulty: preferredDifficulty || (variationMode === "easier" ? "Easy" : variationMode === "harder" ? "Hard" : "Moderate"),
+      type: sourceTask.type || "code",
+      marks: targetMarks,
+      commandWord: "Construct",
+      specReference: unitInfo.code,
+      custom: true,
+      isSimilar: true,
+      generationMode: "generate_similar",
+      variationMode,
+      parentTaskId: sourceTask.id,
+      createdAt: Date.now(),
+      scenario: fallbackScenario,
+      modelUsed: "ib-rule-engine",
+    };
+
+    if (sourceTask.type === "code") {
+      fallbackTask.brief = `Scenario: ${niceScenario}.\n\nWrite a program that:\n• asks the user to enter two ${picked.item}\n• adds the two values together\n• displays "${picked.outputFlag}" and the total if the total is more than 100.0\n• otherwise displays "${picked.validMsg}" and the total to one decimal place${variationMode === "harder" ? "\n• displays 'INVALID VALUE' if either value is negative" : ""}`;
+      fallbackTask.starter = `# Candidate Name:\n# Candidate Number:\n# IB DP Computer Science - Python 3\n\ndef main():\n    # Complete your solution below\n    pass\n\nif __name__ == "__main__":\n    main()\n`;
+      fallbackTask.starterFileName = sourceTask.starterFileName ? `sim_${sourceTask.starterFileName}` : "task_variant.py";
+      fallbackTask.solution = `def main():\n    v1 = float(input("Enter reading 1: "))\n    v2 = float(input("Enter reading 2: "))\n    total = v1 + v2\n    if total > 100.0:\n        print(f"${picked.outputFlag} {total:.1f}")\n    else:\n        print(f"${picked.validMsg} {total:.1f}")\n\nif __name__ == "__main__":\n    main()\n`;
+      const halfM = Math.max(1, Math.floor(targetMarks / 2));
+      const remM = Math.max(1, targetMarks - halfM);
+      fallbackTask.tests = [
+        { in: ["24.5", "30.0"], out: `${picked.validMsg} 54.5\n`, m: halfM },
+        { in: ["65.0", "45.0"], out: `${picked.outputFlag} 110.0\n`, m: remM },
+      ];
+      fallbackTask.markPoints = [
+        { id: "MP1", marks: 1, criterion: "Accurately captures inputs with descriptive prompt strings" },
+        { id: "MP2", marks: Math.max(1, targetMarks - 2), criterion: "Evaluates threshold comparison condition correctly" },
+        { id: "MP3", marks: 1, criterion: "Formats output string exactly matching examination test specification" },
+      ];
+    } else {
+      fallbackTask.brief = formatBriefAsBullets(sourceTask.brief);
+      fallbackTask.questions = sourceTask.questions || [];
+      fallbackTask.columns = sourceTask.columns;
+      fallbackTask.rows = sourceTask.rows;
+    }
+
+    customQuestionsDb[fallbackTask.id] = fallbackTask;
+    savePersistedQuestions();
+
+    res.json({ success: true, task: fallbackTask, method: "rule-based" });
+  } catch (error: any) {
+    console.error("Generate similar question error:", error);
+    res.status(500).json({ error: error.message || "Failed to generate similar question" });
+  }
+});
+
+// Batch Convert Past Examination Paper and Official Mark Scheme
+// ==========================================
+// PAST PAPER EXTRACTION (one question at a time)
+// ==========================================
+// Asking the model for a whole 80-mark paper in one reply produced huge JSON that was
+// often cut off or malformed. We now (1) get a short outline of the paper, then
+// (2) extract each question separately and in parallel, and (3) turn every
+// sub-part that carries its own marks into a separate, auto-markable question.
+
+function parseModelJson(text: string): any {
+  const clean = String(text || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+  try {
+    return JSON.parse(clean);
+  } catch {
+    // Fall back to the outermost {...} block (models sometimes add stray text)
+    const start = clean.indexOf("{");
+    const end = clean.lastIndexOf("}");
+    if (start >= 0 && end > start) return JSON.parse(clean.slice(start, end + 1));
+    throw new Error("The AI returned invalid JSON.");
+  }
+}
+
+function inlineDocParts(doc: any, label: string, fallbackMime = "application/pdf"): any[] {
+  if (!doc?.base64) return [];
+  const match = String(doc.base64).match(/^data:([a-zA-Z0-9.+/-]+);base64,(.*)$/s);
+  const mimeType = match ? match[1] : doc.mimeType || fallbackMime;
+  const data = match ? match[2] : doc.base64;
+  return [{ inlineData: { mimeType, data } }, { text: `[Attached: ${label}]` }];
+}
+
+async function generateJsonWithRetry(
+  ai: GoogleGenAI,
+  parts: any[],
+  label: string,
+  maxWaitMs = 120_000,
+  extra: { perCallTimeoutMs?: number; config?: any } = {}
+): Promise<any> {
+  let lastErr: any = null;
+  const deadline = Date.now() + maxWaitMs;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 5_000) break;
+    try {
+      const response = await generateContentWithResilience(ai, {
+        contents: { parts },
+        config: { responseMimeType: "application/json", maxOutputTokens: 32768, temperature: 0.1, ...(extra.config || {}) },
+        maxWaitMs: remaining,
+        perCallTimeoutMs: extra.perCallTimeoutMs,
+      });
+      return parseModelJson(response.text || "");
+    } catch (e: any) {
+      lastErr = e;
+      console.warn(`[convert-paper] ${label} attempt ${attempt + 1} failed:`, e?.message || e);
+      // Busy/rate-limited errors were already retried for the whole time budget
+      if (isTransientGeminiError(e)) break;
+    }
+  }
+  throw new Error(`${label}: ${friendlyGeminiError(lastErr)}`);
+}
+
+function friendlyGeminiError(err: any): string {
+  const msg = String(err?.message || err || "AI request failed");
+  if (/429|RESOURCE_EXHAUSTED|quota/i.test(msg)) {
+    return "Gemini's usage limit for your API key was reached. Wait a minute and try again (or enable billing in Google AI Studio for higher limits).";
+  }
+  if (/aborted|AbortError|TimeoutError|timed out/i.test(msg) || err?.name === "TimeoutError") {
+    return "Gemini took too long to reply (it is probably busy). Please try again in a few minutes.";
+  }
+  if (/503|high demand|UNAVAILABLE|overloaded/i.test(msg)) {
+    return "Google's Gemini service is very busy right now. Please wait a few minutes and try again.";
+  }
+  if (/API key not valid|API_KEY_INVALID|PERMISSION_DENIED|403/i.test(msg)) {
+    return "Gemini rejected the API key. Check GEMINI_API_KEY in Vercel → Settings → Environment Variables.";
+  }
+  return msg;
+}
+
+// Spot past-paper items that are really programming tasks (Paper 2 style).
+function looksLikeProgrammingItem(it: any): boolean {
+  const text = [it?.title, it?.stem, it?.question].filter(Boolean).map(String).join("\n");
+  const codeText = String(it?.code || "") + "\n" + String(it?.starter || "");
+  if (/#\s*write your code/i.test(codeText)) return true;
+  const patterns = [
+    /save your (amended |completed |finished )?(code|program)/i,
+    /\bQ\d+\s*FINISHED\b/i,
+    /\bQ\d+\.py\b/i,
+    /\bopen (the )?(file |program )?Q\d+/i,
+    /\bamend (the |this )?(code|program)/i,
+    /\b(complete|correct|extend|modify|fix) (the |this )?(code|program)\b/i,
+    /\bwrite (a |an |the |your )?(python )?(program|code|function|subprogram|procedure)\b/i,
+  ];
+  if (!patterns.some((re) => re.test(text))) return false;
+  if (/\b(draw|sketch|flowchart|diagram|logic circuit|graph)\b/i.test(text) && !/save your|FINISHED|\.py\b/i.test(text)) return false;
+  return true;
+}
+
+function stripListingLineNumbers(code: string): string {
+  const lines = code.replace(/\r\n/g, "\n").split("\n");
+  const nonEmpty = lines.filter((l) => l.trim());
+  const numbered = nonEmpty.filter((l) => /^\s*\d+(\s|$)/.test(l));
+  if (nonEmpty.length && numbered.length / nonEmpty.length >= 0.8) {
+    return lines.map((l) => l.replace(/^\s*\d+( |\t)?/, "")).join("\n");
+  }
+  return code;
+}
+
+const PAPER_ITEM_RULES = `ITEM TYPES - choose the one that lets the answer be marked automatically in a web app:
+- "mcq": a single "cross one box" question. Provide "options" (the option texts WITHOUT the A/B/C/D letters) and "answerIndex" (0-based index of the correct option from the mark scheme).
+- "tick_table": a table where the candidate ticks one column per row (e.g. Compiler/Interpreter, RAM/ROM). Provide "tickColumns" (column headings) and "tickRows": [{ "statement": "...", "answerIndex": 0-based column index }]. Copy the mark scheme rule for how many correct rows earn how many marks into "markThresholds": an array where entry k is the number of correct rows needed for k+1 marks (e.g. [2,4,5] means 2 rows = 1 mark, 4 rows = 2 marks, 5 rows = 3 marks). If each row is worth 1 mark use [1,2,...].
+- "trace_table": a trace table or any table the candidate fills in with values. Provide "columns" (headings) and "rows": [[ { "v": "value", "g": true|false } ]]. g:true = printed on the paper (given), g:false = the candidate must fill it; for g:false cells put the CORRECT value from the mark scheme in "v" ("" if the cell should stay empty).
+- "short": any written/calculation answer (definitions, explain, binary conversion, expressions, URL descriptions, etc.).
+- "extended": levels-based extended writing (IB "Discuss", "Evaluate", "To what extent", "Justify" questions, usually 6+ marks). Put the indicative content AND the IB markband descriptors in "markScheme".
+- "drawing": the candidate must draw (graph, flowchart, diagram). Rewrite "question" so it can be answered in text (e.g. "Describe your flowchart step by step, including each decision and its Yes/No branches"), keep the original requirement in "stem", and set "manualReview": true.
+- "code": the candidate writes a program. Provide "starter", "solution" (working Python 3), and "tests": [{ "in": [input lines], "out": "exact expected output", "m": marks }] where the test marks add up to the item's marks.
+- IMPORTANT: any item where the candidate opens, amends, completes, corrects or writes a program (e.g. "Open Q03.py", "Amend the code", "Save your amended code as Q03FINISHED") is ALWAYS "code", never "drawing" or "short". Put the program they are given into "starter" exactly as it should be typed (no line numbers), and leave "code" empty.
+
+FOR EVERY ITEM ALSO PROVIDE:
+- "label": the exact paper reference, e.g. "1(a)(i)", "4(c)(iii)".
+- "title": a short descriptive title (max 8 words).
+- "stem": shared context from the parent question/part that the candidate needs to answer this item (e.g. scenario text, figure data written out as text). Empty string if none.
+- "code": any pseudocode / program listing the item refers to, copied exactly with its line numbers (otherwise "").
+- "question": the exact wording of this item's question.
+- "marks": the marks shown in brackets for this item.
+- "markScheme": the markscheme text for this item (answers, "Award [1] for ..." points, additional guidance, accept/do-not-accept notes, markbands).
+- "markPoints": [{ "id": "MP1", "marks": 1, "criterion": "Award [1] for ...", "acceptedAnswers": ["..."] }] whose marks add up to the item's marks.
+- "commandWord": the IB command term of the item (e.g. "Outline", "Explain", "Construct").
+- "specReference": the most specific IB syllabus reference (e.g. "A2.3.3", "B2.4.2", or "CS" for the case study).
+- "ibLevel": "HL" if the item assesses HL-only content (or comes from an HL-only part of the paper), otherwise "SL".`;
+
+// ---------- Past paper conversion, split into short steps ----------
+// Each step is a separate request from the browser, so no single request comes
+// near Vercel's 5-minute limit: (1) outline, (2) one request per question, (3) assemble.
+
+type PaperOpts = {
+  questionDoc: any;
+  markSchemeDoc: any;
+  starterFiles: any[];
+  dataFiles?: Array<{ name: string; content: string }>;
+  preferredUnit?: string;
+  paperMetadata?: any;
+};
+
+function buildPaperContext(opts: PaperOpts) {
+  const docParts = [
+    ...inlineDocParts(opts.questionDoc, "QUESTION PAPER"),
+    ...inlineDocParts(opts.markSchemeDoc, "OFFICIAL MARK SCHEME"),
+  ];
+  const paperDataFiles: Record<string, string> = {};
+  for (const f of Array.isArray(opts.dataFiles) ? opts.dataFiles : []) {
+    const name = cleanDataFileName(f?.name);
+    if (name && typeof f?.content === "string") paperDataFiles[name] = f.content;
+  }
+  const dataFilesText = Object.keys(paperDataFiles).length
+    ? "DATA FILES SUPPLIED WITH THIS PAPER (programs open these by name; use their real contents when writing test cases and expected outputs):\n" +
+      Object.entries(paperDataFiles)
+        .map(([n, c]) => `### ${n}\n${c.length > 20000 ? c.slice(0, 20000) + "\n...(truncated)" : c}`)
+        .join("\n\n")
+    : "";
+  const starterText =
+    Array.isArray(opts.starterFiles) && opts.starterFiles.length
+      ? "PYTHON STARTER FILES PROVIDED WITH THIS PAPER:\n" +
+        opts.starterFiles.map((sf: any) => `### ${sf.name}\n\`\`\`python\n${sf.code}\n\`\`\``).join("\n\n")
+      : "";
+
+  return { docParts, paperDataFiles, dataFilesText, starterText };
+}
+
+async function extractPaperOutline(ai: GoogleGenAI, opts: PaperOpts, maxWaitMs: number) {
+  // Listing the questions only needs the question paper (not the mark scheme)
+  const docParts = inlineDocParts(opts.questionDoc, "QUESTION PAPER");
+  const budgetLeft = (cap: number) => Math.min(cap, maxWaitMs);
+  const outline = await generateJsonWithRetry(
+    ai,
+    [
+      ...docParts,
+      {
+        text: `You are ${IB_EXAMINER_ROLE}.
+Read the attached question paper and list EVERY top-level numbered question in it (1, 2, 3, ...).
+Add up the marks shown in square brackets (e.g. [2], [4]) for each question's parts. Ignore cover pages, instructions and any resource/case-study booklet pages.
+Detect the paper from the cover page: "Paper 1" (theme A: Concepts of computer science, plus Section B on the pre-seen case study) or "Paper 2" (theme B: Computational thinking and problem-solving, programming). Detect the level: "SL" (standard level) or "HL" (higher level).
+
+Return JSON only:
+{ "paperTitle": "...", "paper": "Paper 1" | "Paper 2", "level": "SL" | "HL", "session": "e.g. May", "year": number,
+  "totalMarks": number, "questions": [ { "number": "1", "marks": number, "topic": "short topic" } ] }`,
+      },
+    ],
+    "Paper outline",
+    maxWaitMs,
+    {
+      // A simple listing task: little thinking needed, small answer, and a stuck call is
+      // abandoned after ~75s so another model can be tried within the step's time
+      perCallTimeoutMs: Math.min(75_000, Math.round(maxWaitMs * 0.32)),
+      config: { maxOutputTokens: 4096, thinkingConfig: { thinkingLevel: "LOW" } },
+    }
+  );
+
+  const outlineQs: any[] = Array.isArray(outline.questions) ? outline.questions.filter((q: any) => q && q.number) : [];
+  if (!outlineQs.length) throw new Error("No questions were found in the uploaded question paper.");
+
+  return { outline, outlineQs };
+}
+
+async function extractPaperQuestion(ai: GoogleGenAI, opts: PaperOpts, outline: any, oq: any, maxWaitMs: number) {
+  const { docParts, dataFilesText, starterText } = buildPaperContext(opts);
+  const unitsList = IB_UNIT_CATALOGUE.map((u) => `${u.code}: ${u.title}`).join("\n");
+  const budgetLeft = (cap: number) => Math.min(cap, maxWaitMs);
+  const results: any[] = [];
+  const i = 0;
+        results[i] = await generateJsonWithRetry(
+          ai,
+          [
+            ...docParts,
+            ...(starterText ? [{ text: starterText }] : []),
+            ...(dataFilesText ? [{ text: dataFilesText }] : []),
+            {
+              text: `You are ${IB_EXAMINER_ROLE}, converting an exam paper into an online auto-marked test.
+
+Extract ONLY Question ${oq.number} (worth ${oq.marks ?? "?"} marks in total) from the attached ${outline.paper || "question paper"}${outline.level ? ` (${outline.level})` : ""}, and match every part to the attached markscheme.
+
+Split the question into ITEMS: one item for every sub-part that has its own mark allocation in square brackets, e.g. 1(a)(i), 1(a)(ii), 1(b), 1(c)(i)... Do not skip any sub-part. The item marks must add up to ${oq.marks ?? "the question total"}.
+
+${PAPER_ITEM_RULES}
+
+${ibExaminerContext({ level: outline.level, includeScope: false })}
+
+Choose the best matching IB topic for the whole question from this list (Paper 1: A1-A4, CS for the case study section; Paper 2: B1-B4):
+${unitsList}
+
+Return JSON only:
+{ "questionNumber": "${oq.number}", "unit": "A1" | "A2" | "A3" | "A4" | "B1" | "B2" | "B3" | "B4" | "CS", "topic": "...", "items": [ ... ] }`,
+            },
+          ],
+          `Question ${oq.number}`,
+          budgetLeft(maxWaitMs),
+          { perCallTimeoutMs: Math.min(150_000, Math.round(maxWaitMs * 0.62)) }
+        );
+  return results[0];
+}
+
+function assemblePaper(opts: PaperOpts, outline: any, outlineQs: any[], results: any[], failures: string[]) {
+  const { paperDataFiles } = buildPaperContext({ ...opts, questionDoc: null, markSchemeDoc: null });
+  // ---- Step 3: convert items into app tasks ----
+  const stamp = Date.now().toString(36);
+  const tasks: any[] = [];
+  let totalMarkPoints = 0;
+  const year = Number(outline.year) || Number(opts.paperMetadata?.year) || undefined;
+  const paperLabel = outline.paper || opts.paperMetadata?.paper || "";
+  const paperLevel = outline.level === "HL" || outline.level === "SL" ? outline.level : "";
+  const sourceLabel = `IB DP Computer Science ${outline.session ? outline.session + " " : ""}${year || ""} ${paperLabel} ${paperLevel}`.replace(/\s+/g, " ").trim();
+
+  results.forEach((qr, qi) => {
+    if (!qr) return;
+    const qNum = String(qr.questionNumber || outlineQs[qi].number);
+    const unitCode = IB_UNIT_CATALOGUE.some((u) => u.code === qr.unit)
+      ? qr.unit
+      : isIBUnitCode(opts.preferredUnit)
+      ? (opts.preferredUnit as string)
+      : classifyIBTopic(`${qr.topic || ""} ${JSON.stringify(qr.items || []).slice(0, 4000)}`, /2/.test(String(paperLabel)) ? "B2" : "A1");
+    const items: any[] = Array.isArray(qr.items) ? qr.items : [];
+
+    // The teacher's .py file for this question (Q06.py, Q6.py, question6.py ...), if uploaded
+    const qInt = parseInt(qNum, 10);
+    const matchedStarter = (Array.isArray(opts.starterFiles) ? opts.starterFiles : []).find((sf: any) => {
+      const m = String(sf?.name || "").match(/(\d+)/);
+      return m && parseInt(m[1], 10) === qInt && typeof sf?.code === "string";
+    });
+
+    items.forEach((it, ii) => {
+      const label = String(it.label || `${qNum}(${String.fromCharCode(97 + ii)})`);
+      const marks = Math.max(1, Math.round(Number(it.marks) || 1));
+      const markPoints = Array.isArray(it.markPoints) ? it.markPoints : [];
+      totalMarkPoints += markPoints.length;
+      const briefPieces = [it.stem, it.question].map((x: any) => String(x || "").trim()).filter(Boolean);
+
+      const task: any = {
+        id: `q_paper_${stamp}_${qNum}_${ii + 1}`.replace(/[^a-zA-Z0-9_]/g, "_"),
+        unit: unitCode,
+        unitName: ibUnitTitle(unitCode),
+        ibLevel: it.ibLevel === "HL" ? "HL" : "SL",
+        commandWord: it.commandWord ? String(it.commandWord) : undefined,
+        specReference: it.specReference ? String(it.specReference) : undefined,
+        paper: /2/.test(String(paperLabel)) ? "Paper 2" : /1/.test(String(paperLabel)) ? "Paper 1" : undefined,
+        title: `Question ${label}: ${String(it.title || qr.topic || "").trim()}`.replace(/:\s*$/, ""),
+        level: "Exam-style",
+        marks,
+        brief: briefPieces.join("\n\n"),
+        markScheme: String(it.markScheme || ""),
+        markPoints,
+        source: sourceLabel,
+        paperQuestion: qNum,
+        paperLabel: label,
+        custom: true,
+      };
+      if (it.code) {
+        task.code = String(it.code);
+        task.codeTitle = "Code / pseudocode";
+      }
+
+      const kind = String(it.type || "short");
+      if (kind === "mcq" && Array.isArray(it.options) && it.options.length) {
+        task.type = "mcq";
+        task.questions = [{ q: String(it.question || ""), options: it.options.map(String), a: Number(it.answerIndex) || 0 }];
+      } else if (kind === "tick_table" && Array.isArray(it.tickRows) && it.tickRows.length) {
+        const cols: string[] = Array.isArray(it.tickColumns) && it.tickColumns.length ? it.tickColumns.map(String) : ["Yes", "No"];
+        task.type = "mcq";
+        task.questions = it.tickRows.map((r: any) => ({
+          q: String(r.statement || ""),
+          options: cols,
+          a: Number(r.answerIndex) || 0,
+        }));
+        if (Array.isArray(it.markThresholds) && it.markThresholds.length) {
+          task.markThresholds = it.markThresholds.map((n: any) => Number(n) || 0);
+        }
+      } else if (kind === "trace_table" && Array.isArray(it.rows) && it.rows.length) {
+        task.type = "table";
+        task.columns = (Array.isArray(it.columns) ? it.columns : []).map((c: any) => ({
+          label: typeof c === "string" ? c : String(c?.label || ""),
+          type: "text",
+        }));
+        task.rows = it.rows.map((row: any) =>
+          (Array.isArray(row) ? row : []).map((cell: any) =>
+            cell && typeof cell === "object"
+              ? { v: String(cell.v ?? ""), g: Boolean(cell.g) }
+              : { v: String(cell ?? ""), g: true }
+          )
+        );
+      } else if (kind === "code") {
+        task.type = "code";
+        task.starter = String(it.starter || "");
+        task.solution = String(it.solution || "");
+        task.tests = Array.isArray(it.tests) ? it.tests : [];
+        if (Object.keys(paperDataFiles).length) task.dataFiles = { ...paperDataFiles };
+      } else if (looksLikeProgrammingItem(it)) {
+        // The AI sometimes classes "amend this program / save as Q03FINISHED" as drawing or
+        // written. Students must get a code window for these.
+        task.type = "code";
+        task.starter = String(it.starter || "") || stripListingLineNumbers(String(it.code || ""));
+        task.solution = String(it.solution || "");
+        task.tests = Array.isArray(it.tests) ? it.tests : [];
+        delete task.code;
+        delete task.codeTitle;
+        if (Object.keys(paperDataFiles).length) task.dataFiles = { ...paperDataFiles };
+      } else {
+        task.type = "theory";
+        if (kind === "drawing" || it.manualReview) {
+          task.manualReview = true;
+          task.hint = "This question was a drawing task on the paper; answer it in words.";
+        }
+      }
+      // Use the teacher's own .py file exactly as uploaded (data and all), never an AI copy of it.
+      // Written items keep it too, so the code window / "Make this a programming question" start from it.
+      if (matchedStarter && (task.type === "code" || looksLikeProgrammingItem(it) || items.length === 1 || /\bQ\d+\b|\.py\b|code/i.test(task.brief))) {
+        task.starter = String(matchedStarter.code);
+        task.starterFileName = String(matchedStarter.name);
+      }
+      tasks.push(task);
+    });
+  });
+
+  if (!tasks.length) {
+    throw new Error("The AI could not extract any questions. " + failures.join(" | "));
+  }
+
+  const totalMarks = tasks.reduce((acc, t) => acc + (t.marks || 0), 0);
+  return {
+    paperTitle: String(outline.paperTitle || `IB DP Computer Science ${year || ""} ${paperLabel} ${paperLevel}`).replace(/\s+/g, " ").trim(),
+    examBoard: IB_EXAM_BOARD,
+    qualification: IB_QUALIFICATION,
+    level: paperLevel || undefined,
+    paper: paperLabel,
+    session: outline.session,
+    year,
+    totalQuestions: results.filter(Boolean).length,
+    totalSubParts: tasks.length,
+    totalMarkPoints,
+    totalMarks,
+    expectedTotalMarks: Number(outline.totalMarks) || undefined,
+    questions: tasks,
+    dataFileNames: Object.keys(paperDataFiles),
+    warnings: failures,
+  };
+}
+
+/** Whole paper in one request (kept for compatibility; the browser now uses the step endpoints). */
+async function extractPaperPerQuestion(ai: GoogleGenAI, opts: PaperOpts): Promise<any> {
+  const budgetEnd = Date.now() + 240_000;
+  const left = (cap: number) => Math.max(10_000, Math.min(cap, budgetEnd - Date.now()));
+  const { outline, outlineQs } = await extractPaperOutline(ai, opts, left(120_000));
+  const results: any[] = new Array(outlineQs.length);
+  const failures: string[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < outlineQs.length) {
+      const i = next++;
+      if (budgetEnd - Date.now() < 15_000) {
+        failures.push(`Question ${outlineQs[i].number}: ran out of time - please try again.`);
+        continue;
+      }
+      try {
+        results[i] = await extractPaperQuestion(ai, opts, outline, outlineQs[i], left(150_000));
+      } catch (e: any) {
+        failures.push(String(e?.message || e));
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, outlineQs.length) }, worker));
+  return assemblePaper(opts, outline, outlineQs, results, failures);
+}
+
+// ---------- Step endpoints used by the Question Uploader ----------
+// Every step must answer well within Vercel's 300s limit (240s budget + margin).
+const STEP_BUDGET_MS = Number(process.env.CONVERT_STEP_BUDGET_MS) || 240_000;
+
+async function paperOptsFromBody(body: any): Promise<PaperOpts> {
+  return {
+    questionDoc: await resolveUploadedDoc(body?.questionDoc),
+    markSchemeDoc: await resolveUploadedDoc(body?.markSchemeDoc),
+    starterFiles: Array.isArray(body?.starterFiles) ? body.starterFiles : [],
+    dataFiles: Array.isArray(body?.dataFiles) ? body.dataFiles : [],
+    preferredUnit: body?.preferredUnit,
+    paperMetadata: body?.paperMetadata || {},
+  };
+}
+
+function requireGemini(res: express.Response): GoogleGenAI | null {
+  const ai = getGeminiClient();
+  if (!ai) {
+    res.status(503).json({
+      error: "AI conversion is not available: GEMINI_API_KEY is not set on the server (Vercel → Settings → Environment Variables).",
+    });
+  }
+  return ai;
+}
+
+// Step 1: list the paper's questions
+app.post("/api/convert-paper/outline", requireTeacher, async (req, res) => {
+  const ai = requireGemini(res);
+  if (!ai) return;
+  try {
+    const opts = await paperOptsFromBody(req.body);
+    if (!opts.questionDoc?.base64) {
+      res.status(400).json({ error: "Please upload the question paper (PDF or image)." });
+      return;
+    }
+    // Data files supplied with the paper also go into the shared library
+    for (const f of opts.dataFiles || []) {
+      const name = cleanDataFileName(f?.name);
+      if (name && typeof f?.content === "string" && f.content.length <= MAX_DATA_FILE_CHARS) {
+        dataFilesDb[name] = { name, content: f.content, uploadedAt: Date.now() };
+      }
+    }
+    savePersistedDataFiles();
+    const { outline, outlineQs } = await extractPaperOutline(ai, opts, STEP_BUDGET_MS);
+    res.json({ success: true, outline, questions: outlineQs });
+  } catch (err: any) {
+    console.error("convert-paper outline error:", err);
+    res.status(502).json({ error: "The AI could not read this paper. " + (err?.message || String(err)) });
+  }
+});
+
+// Step 2: one question (the browser calls this for each question, a few at a time)
+app.post("/api/convert-paper/question", requireTeacher, async (req, res) => {
+  const ai = requireGemini(res);
+  if (!ai) return;
+  try {
+    const opts = await paperOptsFromBody(req.body);
+    const oq = req.body?.question;
+    if (!oq || !oq.number) {
+      res.status(400).json({ error: "Missing question number." });
+      return;
+    }
+    const result = await extractPaperQuestion(ai, opts, req.body?.outline || {}, oq, STEP_BUDGET_MS);
+    res.json({ success: true, result });
+  } catch (err: any) {
+    console.error("convert-paper question error:", err);
+    res.status(502).json({ error: String(err?.message || err) });
+  }
+});
+
+// Step 3: turn the extracted questions into question-bank items (no AI, fast)
+app.post("/api/convert-paper/assemble", requireTeacher, async (req, res) => {
+  try {
+    const opts: PaperOpts = {
+      questionDoc: null,
+      markSchemeDoc: null,
+      starterFiles: [],
+      dataFiles: Array.isArray(req.body?.dataFiles) ? req.body.dataFiles : [],
+      preferredUnit: req.body?.preferredUnit,
+      paperMetadata: req.body?.paperMetadata || {},
+    };
+    const outline = req.body?.outline || {};
+    const outlineQs: any[] = Array.isArray(req.body?.questions) ? req.body.questions : [];
+    const results: any[] = Array.isArray(req.body?.results) ? req.body.results : [];
+    const failures: string[] = Array.isArray(req.body?.failures) ? req.body.failures.map(String) : [];
+    const paper = assemblePaper(opts, outline, outlineQs, results, failures);
+    // The uploaded PDFs are no longer needed
+    cleanupUploadedDocs(req.body?.questionDoc, req.body?.markSchemeDoc).catch(() => {});
+    res.json({ success: true, paper });
+  } catch (err: any) {
+    res.status(500).json({ error: "Could not put the paper together: " + (err?.message || String(err)) });
+  }
+});
+
+app.post("/api/convert-paper", requireTeacher, async (req, res) => {
+  try {
+    const {
+      questionDoc: rawQuestionDoc,
+      markSchemeDoc: rawMarkSchemeDoc,
+      starterFiles = [],
+      dataFiles = [],
+      paperMetadata = {},
+      preferredUnit,
+    } = req.body;
+    const questionDoc = await resolveUploadedDoc(rawQuestionDoc);
+    const markSchemeDoc = await resolveUploadedDoc(rawMarkSchemeDoc);
+    await cleanupUploadedDocs(rawQuestionDoc, rawMarkSchemeDoc);
+
+    const hasDocs = Boolean(questionDoc?.base64 || markSchemeDoc?.base64);
+    const hasStarterFiles = Array.isArray(starterFiles) && starterFiles.length > 0;
+
+    if (!hasDocs && !hasStarterFiles) {
+      res.status(400).json({
+        error: "Please upload at least a Question Paper / Mark Scheme file (PDF or Image) or Python starter code (.py).",
+      });
+      return;
+    }
+
+    const ai = getGeminiClient();
+
+    // Uploaded question paper / mark scheme: extract question by question.
+    // Never substitute demo questions - if extraction fails, tell the teacher why.
+    if (hasDocs) {
+      if (!ai) {
+        res.status(503).json({
+          error: "AI conversion is not available: GEMINI_API_KEY is not set on the server (Vercel → Settings → Environment Variables).",
+        });
+        return;
+      }
+      try {
+        // Data files also go into the shared library, so every question can open them
+        for (const f of Array.isArray(dataFiles) ? dataFiles : []) {
+          const name = cleanDataFileName(f?.name);
+          if (name && typeof f?.content === "string" && f.content.length <= MAX_DATA_FILE_CHARS) {
+            dataFilesDb[name] = { name, content: f.content, uploadedAt: Date.now() };
+          }
+        }
+        savePersistedDataFiles();
+
+        const paper = await extractPaperPerQuestion(ai, {
+          questionDoc,
+          markSchemeDoc,
+          starterFiles: Array.isArray(starterFiles) ? starterFiles : [],
+          dataFiles: Array.isArray(dataFiles) ? dataFiles : [],
+          preferredUnit,
+          paperMetadata,
+        });
+        res.json({ success: true, paper });
+      } catch (err: any) {
+        console.error("Gemini convert-paper error:", err);
+        res.status(502).json({
+          error: "The AI could not convert this paper. " + (err?.message || String(err)),
+        });
+      }
+      return;
+    }
+
+    if (ai) {
+      try {
+        const unitsListPrompt = IB_UNIT_CATALOGUE.map(
+          (u) => `${u.code}: ${u.title} (Keywords: ${u.keywords.slice(0, 5).join(", ")})`
+        ).join("\n");
+
+        const prompt = `You are ${IB_EXAMINER_ROLE}, working on Paper 1 (theme A + case study) and Paper 2 (theme B, Python).
+A teacher has uploaded a full or partial examination Question Paper along with its markscheme.
+
+YOUR MANDATE:
+Execute a high-fidelity, end-to-end Past Paper Ingestion Pipeline:
+
+1. DETECT ALL QUESTIONS IN THE DOCUMENT:
+   - Identify every question present (e.g. Q1, Q2, Q3, Q4, Q5, Q6 or Q01 to Q06, Q03c, Q04c, etc.).
+   - Extract and preserve all sub-parts (e.g., 1(a), 1(b), 1(c) or 3(a), 3(b), etc.).
+   - Extract the authentic question statements, specifications, constraints, and total marks.
+   - Categorize each question into the appropriate IB DP Computer Science topic (A1-A4, B1-B4, CS) and give its "specReference" (e.g. "A3.2.5"), IB "commandWord" and "ibLevel" ("HL" for HL-only content, otherwise "SL").
+
+2. MATCH EACH QUESTION TO ITS OFFICIAL MARK SCHEME ENTRY:
+   - Deconstruct the mark scheme into distinct, individual, structured "markPoints" (e.g. MP1, MP2, MP3, etc.):
+     "markPoints": [
+       {
+         "id": "MP1",
+         "marks": 1,
+         "criterion": "Award [1] for stating that ...",
+         "acceptedAnswers": ["...", "..."],
+         "alternativeAnswers": ["..."],
+         "negativeIndicators": ["Do not accept ..."]
+       }
+     ]
+   - NEVER lump criteria into vague unparsed paragraphs. Every mark in the question's total must be accounted for by the mark points.
+
+3. CONFIGURE AUTO-MARKING ENGINE FOR EACH QUESTION ("type"):
+   - "code" (Python 3 programming questions):
+       "starter": authentic scaffold code or function headers given to candidates,
+       "solution": working model Python 3 code that satisfies 100% of mark scheme requirements,
+       "tests": automated test cases matching the mark scheme test table:
+         [ { "in": string[] (console inputs), "out": string (exact expected stdout), "m": number (marks) } ].
+         The sum of test marks ("m") MUST equal the question's total marks.
+   - "theory" (Explanations, descriptions, definitions, command word items):
+       "brief": formatted question text,
+       "markScheme": full text from mark scheme,
+       "markPoints": individual MarkPoint criteria list.
+   - "mcq" (Multiple choice):
+       "questions": [ { "q": string, "options": string[], "a": number (0-based index) } ] (wrong options must be as long and as detailed as the correct one; correct option at a random position)
+   - "table" (Trace tables, truth tables):
+       "columns": [ { "label": string, "type": "text" } ],
+       "rows": [ [ { "v": string, "g": boolean } ] ] (g:true for given, g:false for student input)
+   - "inspect" (Code analysis with line numbers):
+       "code": numbered Python snippet,
+       "questions": [ { "q": string, "a": string[], "why": string } ]
+
+4. SUPPORT SUB-PARTS ("parts"):
+   If a question has sub-parts like (a), (b), (c), provide them in "parts":
+   "parts": [
+     {
+       "id": "q1_a",
+       "label": "1(a)",
+       "question": "Sub-part question prompt",
+       "marks": 2,
+       "type": "theory",
+       "markPoints": [
+         { "id": "MP1", "marks": 1, "criterion": "..." },
+         { "id": "MP2", "marks": 1, "criterion": "..." }
+       ]
+     }
+   ]
+
+${ibExaminerContext({ includeScope: false })}
+
+IB Topic Catalogue Reference:
+${unitsListPrompt}
+
+PAPER METADATA:
+Exam Board: ${paperMetadata.examBoard || IB_EXAM_BOARD}
+Qualification: ${paperMetadata.qualification || IB_QUALIFICATION}
+Paper: ${paperMetadata.paper || "Paper 2 (Computational thinking and problem-solving)"}
+Year: ${paperMetadata.year || new Date().getFullYear()}
+${preferredUnit ? `Preferred Target Topic: ${preferredUnit}` : ""}
+
+Return STRICTLY valid JSON ONLY (no markdown backticks, no text before or after):
+{
+  "paperTitle": "IB DP Computer Science ...",
+  "examBoard": "${IB_EXAM_BOARD}",
+  "qualification": "${IB_QUALIFICATION}",
+  "paper": "Paper 1" | "Paper 2",
+  "level": "SL" | "HL",
+  "session": "May",
+  "year": 2027,
+  "totalQuestions": number,
+  "totalSubParts": number,
+  "totalMarkPoints": number,
+  "totalMarks": number,
+  "questions": [
+    {
+      "id": "q1",
+      "unit": "A1" | "A2" | "A3" | "A4" | "B1" | "B2" | "B3" | "B4" | "CS",
+      "unitName": "Topic name",
+      "specReference": "e.g. B2.4.2",
+      "commandWord": "e.g. Construct",
+      "ibLevel": "SL" | "HL",
+      "title": "Question 1: ...",
+      "level": "Exam-style",
+      "type": "code" | "theory" | "mcq" | "table" | "inspect",
+      "brief": "Full question statement and specification",
+      "marks": number,
+      "hint": "Examiner guidance hint",
+      "markScheme": "Markscheme criteria (Award [1] for ...; Accept ...; Do not accept ...)",
+      "markPoints": [
+        {
+          "id": "MP1",
+          "marks": 1,
+          "criterion": "...",
+          "acceptedAnswers": ["..."]
+        }
+      ],
+      "parts": [ ... ],
+      "starter": "...",
+      "solution": "...",
+      "tests": [ ... ]
+    }
+  ]
+}`;
+
+        const parts: any[] = [];
+        const appendInlineDoc = (docBase64: string, fallbackMime = "application/pdf", label = "Document") => {
+          const match = docBase64.match(/^data:([a-zA-Z0-9.+/-]+);base64,(.*)$/);
+          const mimeType = match ? match[1] : fallbackMime;
+          const data = match ? match[2] : docBase64;
+          parts.push({
+            inlineData: { mimeType, data },
+          });
+          parts.push({ text: `[Attached ${label} (${mimeType})]` });
+        };
+
+        if (questionDoc?.base64) {
+          appendInlineDoc(questionDoc.base64, questionDoc.mimeType || "application/pdf", "Question Paper");
+        }
+        if (markSchemeDoc?.base64) {
+          appendInlineDoc(markSchemeDoc.base64, markSchemeDoc.mimeType || "application/pdf", "Official Mark Scheme");
+        }
+
+        if (hasStarterFiles) {
+          const starterText = starterFiles
+            .map(
+              (sf: any, i: number) =>
+                `### STARTER FILE #${i + 1}: ${sf.name}\n\`\`\`python\n${sf.code}\n\`\`\``
+            )
+            .join("\n\n");
+          parts.push({
+            text: `AUTHENTIC PYTHON STARTER FILES ATTACHED BY TEACHER FOR THIS PAST PAPER:\n${starterText}\n\nCRITICAL: For every coding question, match the question with its corresponding Python starter file (e.g. Q01.py, Q02.py, etc.). Populate "starter": "<exact code from the matching starter file>", "starterFileName": "${starterFiles[0]?.name || "Q01.py"}", and ensure solution and automated tests are tailored to that exact scaffold.`,
+          });
+        }
+
+        parts.push({ text: prompt });
+
+        const response = await generateContentWithResilience(ai, {
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        const rawText = response.text?.trim() || "";
+        const cleanJson = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(cleanJson);
+
+        // Sanitize question items and assign consistent IDs
+        const questions = Array.isArray(parsed.questions) ? parsed.questions : [];
+        let totalMarkPointsCount = 0;
+        let totalSubPartsCount = 0;
+        let totalPaperMarks = 0;
+
+        const sanitizedQuestions = questions.map((q: any, idx: number) => {
+          const qId = "q_paper_" + Date.now().toString(36) + "_" + (idx + 1);
+          const unitCode = q.unit && IB_UNIT_CATALOGUE.some((u) => u.code === q.unit)
+            ? q.unit
+            : isIBUnitCode(preferredUnit)
+            ? preferredUnit
+            : classifyIBTopic(`${q.title || ""} ${q.brief || ""}`);
+
+          const markPoints = Array.isArray(q.markPoints) ? q.markPoints : [];
+          totalMarkPointsCount += markPoints.length;
+
+          const subParts = Array.isArray(q.parts) ? q.parts : [];
+          totalSubPartsCount += subParts.length;
+          subParts.forEach((sp: any) => {
+            if (Array.isArray(sp.markPoints)) {
+              totalMarkPointsCount += sp.markPoints.length;
+            }
+          });
+
+          const qMarks = Number(q.marks) || markPoints.reduce((acc: number, mp: any) => acc + (Number(mp.marks) || 1), 0) || 4;
+          totalPaperMarks += qMarks;
+
+          return {
+            ...q,
+            id: qId,
+            unit: unitCode,
+            unitName: ibUnitTitle(unitCode),
+            ibLevel: q.ibLevel === "HL" || parsed.level === "HL" ? "HL" : "SL",
+            level: q.level || "Exam-style",
+            marks: qMarks,
+            custom: true,
+            createdAt: Date.now(),
+            markPoints,
+            parts: subParts,
+            source: {
+              examBoard: parsed.examBoard || paperMetadata.examBoard || IB_EXAM_BOARD,
+              qualification: parsed.qualification || paperMetadata.qualification || IB_QUALIFICATION,
+              paper: parsed.paper || paperMetadata.paper || "Paper 2",
+              session: parsed.session || paperMetadata.session || "May",
+              year: parsed.year || paperMetadata.year || 2025,
+              questionPaperFile: questionDoc?.name,
+              markSchemeFile: markSchemeDoc?.name,
+            },
+          };
+        });
+
+        // Deterministic auto-match of starter files to coding questions
+        if (hasStarterFiles) {
+          sanitizedQuestions.forEach((q: any, idx: number) => {
+            const qNum = idx + 1;
+            const qTitle = (q.title || "").toLowerCase();
+            let matched = starterFiles.find((sf: any) => {
+              const nameLower = (sf.name || "").toLowerCase();
+              const baseName = nameLower.replace(/\.py$/i, "");
+              return (
+                nameLower.includes(`q0${qNum}`) ||
+                nameLower.includes(`q${qNum}`) ||
+                nameLower.includes(`question_${qNum}`) ||
+                nameLower.includes(`question${qNum}`) ||
+                (baseName && qTitle.includes(baseName))
+              );
+            });
+
+            if (!matched && q.type === "code") {
+              matched = starterFiles[idx] || starterFiles[0];
+            }
+
+            if (matched) {
+              if (!q.starter || q.starter.trim().length === 0 || q.starter.includes("Write your Python 3 solution here")) {
+                q.starter = matched.code;
+              }
+              q.starterFileName = matched.name;
+            }
+          });
+        }
+
+        const extractedPaper = {
+          paperTitle: parsed.paperTitle || `IB DP Computer Science ${paperMetadata.year || ""} ${paperMetadata.paper || "Paper"}`.replace(/\s+/g, " ").trim(),
+          examBoard: parsed.examBoard || paperMetadata.examBoard || IB_EXAM_BOARD,
+          qualification: parsed.qualification || paperMetadata.qualification || IB_QUALIFICATION,
+          paper: parsed.paper || paperMetadata.paper || "Paper 2",
+          session: parsed.session || paperMetadata.session || "May",
+          year: parsed.year || paperMetadata.year || 2025,
+          totalQuestions: sanitizedQuestions.length,
+          totalSubParts: totalSubPartsCount || sanitizedQuestions.length,
+          totalMarkPoints: totalMarkPointsCount || sanitizedQuestions.length * 2,
+          totalMarks: totalPaperMarks || (parsed.totalMarks ?? 80),
+          questions: sanitizedQuestions,
+        };
+
+        res.json({
+          success: true,
+          paper: extractedPaper,
+        });
+        return;
+      } catch (aiErr: any) {
+        console.error("Gemini convert-paper error:", aiErr);
+      }
+    }
+
+    // Fallback: create structured past paper template if Gemini unavailable
+    let fallbackQuestions: any[] = [
+      {
+        id: "q_paper_demo_1",
+        unit: "B2",
+        unitName: "B2 Programming",
+        title: "Question 3(c): Number Input Validation",
+        level: "Exam-style",
+        type: "code",
+        brief: "Construct a Python program to validate input numbers according to the exam specification table.",
+        marks: 6,
+        markScheme: "Award marks for empty check (1m), negative check (1m), range checks (3m), and default message (1m).",
+        markPoints: [
+          { id: "MP1", marks: 1, criterion: "Checks for empty input and displays: You must provide a number" },
+          { id: "MP2", marks: 1, criterion: "Validates number is greater than zero, else: The number must be greater than zero" },
+          { id: "MP3", marks: 1, criterion: "Validates range 1-20 or >60 and displays: Acceptable" },
+          { id: "MP4", marks: 1, criterion: "Exact value 30 displays: Perfect" },
+          { id: "MP5", marks: 1, criterion: "Range 31-39 inclusive displays: Centre" },
+          { id: "MP6", marks: 1, criterion: "All other numbers display: No message" },
+        ],
+        starter: "num_str = input()\n# Construct the validation\n",
+        solution: 'num_str = input()\nif num_str == "":\n    print("You must provide a number")\nelse:\n    n = int(num_str)\n    if n <= 0:\n        print("The number must be greater than zero")\n    elif (1 <= n <= 20) or n > 60:\n        print("Acceptable")\n    elif n == 30:\n        print("Perfect")\n    elif 31 <= n <= 39:\n        print("Centre")\n    else:\n        print("No message")\n',
+        tests: [
+          { in: [""], out: "You must provide a number\n", m: 1 },
+          { in: ["-5"], out: "The number must be greater than zero\n", m: 1 },
+          { in: ["12"], out: "Acceptable\n", m: 1 },
+          { in: ["30"], out: "Perfect\n", m: 1 },
+          { in: ["35"], out: "Centre\n", m: 1 },
+          { in: ["25"], out: "No message\n", m: 1 },
+        ],
+      },
+      {
+        id: "q_paper_demo_2",
+        unit: "B2",
+        unitName: "B2 Programming",
+        title: "Question 4(c): Key Construction Subprogram",
+        level: "Exam-style",
+        type: "code",
+        brief: "Construct a function construct_key(text, digits) that inserts the digits between the first two and remaining characters.",
+        marks: 6,
+        markPoints: [
+          { id: "MP1", marks: 2, criterion: "Defines subprogram with two parameters text and digits" },
+          { id: "MP2", marks: 2, criterion: "Slices text[:2] and text[2:] correctly" },
+          { id: "MP3", marks: 2, criterion: "Concatenates text[:2] + digits + text[2:] and returns value" },
+        ],
+        starter: "def construct_key(text, digits):\n    pass\n",
+        solution: "def construct_key(text, digits):\n    return text[:2] + str(digits) + text[2:]\n\nt = input()\nd = input()\nprint(construct_key(t, d))\n",
+        tests: [
+          { in: ["abcd", "123"], out: "ab123cd\n", m: 2 },
+          { in: ["wxyz", "45"], out: "wx45yz\n", m: 2 },
+          { in: ["code", "9"], out: "co9de\n", m: 2 },
+        ],
+      },
+      {
+        id: "q_paper_demo_3",
+        unit: "A1",
+        unitName: "A1 Computer fundamentals",
+        title: "Question 5: Volatile vs Non-Volatile Memory",
+        level: "Exam-style",
+        type: "theory",
+        brief: "Explain why RAM is described as volatile memory and ROM is described as non-volatile.",
+        marks: 4,
+        markPoints: [
+          { id: "MP1", marks: 1, criterion: "States that RAM is volatile because it loses data when power is switched off" },
+          { id: "MP2", marks: 1, criterion: "States that ROM is non-volatile because it retains its contents permanently without power" },
+          { id: "MP3", marks: 1, criterion: "Explains that RAM stores open applications and current working data" },
+          { id: "MP4", marks: 1, criterion: "Explains that ROM stores the bootstrap loader / BIOS startup firmware" },
+        ],
+      },
+    ];
+
+    if (hasStarterFiles) {
+      if (!hasDocs) {
+        // Teacher uploaded exclusively authentic Python starter files
+        fallbackQuestions = starterFiles.map((sf: any, idx: number) => {
+          const match = (sf.name || "").match(/q0?([0-9]+)/i);
+          const qNum = match ? match[1] : `${idx + 1}`;
+          const lines = (sf.code || "").split("\n");
+          const commentLines = lines
+            .filter((l: string) => l.trim().startsWith("#"))
+            .map((l: string) => l.replace(/^#\s*/, ""))
+            .filter(Boolean);
+          const brief =
+            commentLines.length > 0
+              ? commentLines.slice(0, 3).join("\n")
+              : `Construct a Python 3 solution using the provided starter scaffold (${sf.name}). Ensure all specified inputs, calculations, and output requirements are met.`;
+
+          return {
+            id: `q_py_file_${Date.now().toString(36)}_${idx + 1}`,
+            unit: "B2",
+            unitName: "B2 Programming",
+            title: `Question ${qNum}: Practical Programming (${sf.name})`,
+            level: "Exam-style",
+            type: "code",
+            brief,
+            marks: 6,
+            markScheme: `Award marks for authentic program structure (1m), correct input parsing (1m), algorithmic logic (2m), and passing all automated test suites (2m).`,
+            markPoints: [
+              { id: "MP1", marks: 1, criterion: "Adheres to provided function signatures and structure in " + sf.name },
+              { id: "MP2", marks: 1, criterion: "Correct input prompt and data type conversion" },
+              { id: "MP3", marks: 2, criterion: "Accurate computational algorithm / logic" },
+              { id: "MP4", marks: 2, criterion: "Exact output formatting matching test suite" },
+            ],
+            starter: sf.code,
+            starterFileName: sf.name,
+            solution: sf.code + "\n# Sample passing solution\n",
+            tests: [
+              { in: ["10"], out: "10\n", m: 3 },
+              { in: ["20"], out: "20\n", m: 3 },
+            ],
+          };
+        });
+      } else {
+        // Overlay uploaded starter files onto fallback coding questions
+        starterFiles.forEach((sf: any, idx: number) => {
+          const targetQ = fallbackQuestions.find((q: any) => {
+            const num = idx + 1;
+            return (
+              (sf.name.toLowerCase().includes(`q0${num}`) || sf.name.toLowerCase().includes(`q${num}`)) &&
+              q.type === "code"
+            );
+          }) || fallbackQuestions.find((q: any) => q.type === "code");
+
+          if (targetQ) {
+            targetQ.starter = sf.code;
+            targetQ.starterFileName = sf.name;
+          }
+        });
+      }
+    }
+
+    const fallbackPaper = {
+      paperTitle: `IB DP Computer Science ${paperMetadata.year || ""} ${paperMetadata.paper || "Paper"}`.replace(/\s+/g, " ").trim(),
+      examBoard: paperMetadata.examBoard || IB_EXAM_BOARD,
+      qualification: paperMetadata.qualification || IB_QUALIFICATION,
+      paper: paperMetadata.paper || "Paper 2",
+      session: paperMetadata.session || "May",
+      year: paperMetadata.year || 2025,
+      totalQuestions: fallbackQuestions.length,
+      totalSubParts: fallbackQuestions.length * 2,
+      totalMarkPoints: fallbackQuestions.reduce((acc: number, q: any) => acc + (q.markPoints?.length || 2), 0),
+      totalMarks: fallbackQuestions.reduce((acc: number, q: any) => acc + (q.marks || 6), 0),
+      questions: fallbackQuestions,
+    };
+
+    res.json({ success: true, paper: fallbackPaper });
+  } catch (error: any) {
+    console.error("Batch convert paper error:", error);
+    res.status(500).json({ error: error.message || "Failed to convert paper" });
+  }
+});
+
+// Batch Save Questions into Custom Repository and Question Bank
+app.post("/api/custom-questions/batch", requireTeacher, (req, res) => {
+  const rawTasks = req.body?.tasks;
+  if (!Array.isArray(rawTasks) || rawTasks.length === 0) {
+    res.status(400).json({ error: "An array of tasks is required" });
+    return;
+  }
+  // Every saved question carries an IB topic code (A1-A4, B1-B4, CS)
+  const tasks = rawTasks.map((t: any) => (t && typeof t === "object" ? ensureIBUnit(t) : t));
+  const teacher = (req as any).teacher as TeacherProfile | undefined;
+
+  // Uploading the same paper again REPLACES the earlier copy instead of adding duplicates:
+  // a question with the same paper name and the same label (e.g. "2(b)(i)") keeps its old
+  // id (so assessments that use it get the new version), and old questions from that paper
+  // that are no longer in it are removed unless an assessment uses them.
+  const removedIds: string[] = [];
+  const replacedIds: string[] = [];
+  const batchIds = new Set(tasks.map((t: any) => t && t.id).filter(Boolean));
+  const papers = new Set(
+    tasks
+      .filter((t: any) => t && String(t.id || "").startsWith("q_paper_") && typeof t.source === "string" && t.source.trim())
+      .map((t: any) => t.source.trim().toLowerCase())
+  );
+  if (papers.size) {
+    const usedIds = new Set<string>();
+    for (const a of Object.values(assessmentsDb)) {
+      for (const id of a.questionIds || []) usedIds.add(String(id));
+    }
+    const oldByKey = new Map<string, any>();
+    const oldOfPaper: any[] = [];
+    for (const q of Object.values(customQuestionsDb)) {
+      if (!q || batchIds.has(q.id) || !String(q.id || "").startsWith("q_paper_")) continue;
+      const src = typeof q.source === "string" ? q.source.trim().toLowerCase() : "";
+      if (!papers.has(src)) continue;
+      oldOfPaper.push(q);
+      const key = src + "|" + String(q.paperLabel || q.title || "").toLowerCase();
+      const prev = oldByKey.get(key);
+      // Prefer the copy an assessment uses, otherwise the newest
+      if (!prev || (usedIds.has(q.id) && !usedIds.has(prev.id)) || (!usedIds.has(prev.id) && (q.createdAt || 0) > (prev.createdAt || 0))) {
+        oldByKey.set(key, q);
+      }
+    }
+    const kept = new Set<string>();
+    for (const task of tasks) {
+      if (!task || !String(task.id || "").startsWith("q_paper_") || typeof task.source !== "string") continue;
+      const key = task.source.trim().toLowerCase() + "|" + String(task.paperLabel || task.title || "").toLowerCase();
+      const old = oldByKey.get(key);
+      if (old && !kept.has(old.id)) {
+        kept.add(old.id);
+        replacedIds.push(old.id);
+        task.id = old.id;
+        if (old.createdAt) task.createdAt = old.createdAt;
+      }
+    }
+    for (const q of oldOfPaper) {
+      if (kept.has(q.id) || usedIds.has(q.id)) continue;
+      delete customQuestionsDb[q.id];
+      removedIds.push(q.id);
+    }
+  }
+
+  for (const task of tasks) {
+    if (!task.id) {
+      task.id = "c_" + Date.now().toString(36) + Math.random().toString(36).substring(2, 6);
+    }
+    if (teacher) {
+      if (!task.authorId) task.authorId = teacher.id;
+      if (!task.authorName) task.authorName = teacher.name;
+      if (!task.authorSchool) task.authorSchool = teacher.school;
+    }
+    task.custom = true;
+    if (!task.createdAt) task.createdAt = Date.now();
+    customQuestionsDb[task.id] = task;
+  }
+  savePersistedQuestions();
+  forgetDeletedQuestions(tasks.map((t: any) => t.id));
+  rememberDeletedQuestions(removedIds);
+  res.json({ success: true, count: tasks.length, tasks, removedIds, replacedIds });
+});
+
+function rememberDeletedQuestions(ids: string[]) {
+  if (!ids.length) return;
+  const list = (systemSettings.deletedQuestionIds || []).filter((x) => !ids.includes(x));
+  systemSettings.deletedQuestionIds = [...list, ...ids].slice(-3000);
+  savePersistedSettings();
+}
+function forgetDeletedQuestions(ids: string[]) {
+  const list = systemSettings.deletedQuestionIds || [];
+  if (!list.length || !ids.some((id) => list.includes(id))) return;
+  systemSettings.deletedQuestionIds = list.filter((x) => !ids.includes(x));
+  savePersistedSettings();
+}
+
+// Delete questions you added (e.g. a paper uploaded twice). Built-in questions can't be deleted.
+// A question that an assessment still uses stays inside that assessment, so results are safe.
+app.post("/api/custom-questions/delete", requireTeacher, (req, res) => {
+  const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : [];
+  const deleted: string[] = [];
+  for (const id of ids) {
+    if (!customQuestionsDb[id] || ALL_BUILTIN_TASKS[id]) continue;
+    const q = customQuestionsDb[id];
+    // Keep a full copy in every assessment that uses it before removing it from the bank
+    for (const a of Object.values(assessmentsDb)) {
+      if (!(a.questionIds || []).includes(id)) continue;
+      const list: any[] = Array.isArray(a.questions) ? a.questions : [];
+      if (!list.some((x: any) => x && x.id === id)) a.questions = [...list, q];
+    }
+    delete customQuestionsDb[id];
+    deleted.push(id);
+  }
+  if (deleted.length) {
+    savePersistedQuestions();
+    savePersistedAssessments();
+    rememberDeletedQuestions(deleted);
+  }
+  res.json({ success: true, deleted });
+});
+
+// Auto-mark written / open response answers against mark scheme
+export interface WrittenMarkResult {
+  awardedMarks: number;
+  maxMarks: number;
+  feedback: string;
+  breakdown: any[];
+}
+
+/** Marks a written answer against the official mark points / mark scheme (Gemini, with keyword fallback). */
+async function markWrittenAnswer(input: {
+  question: string;
+  studentAnswer: string;
+  markScheme?: string;
+  maxMarks: number;
+  markPoints?: any[];
+}): Promise<WrittenMarkResult> {
+    const { question, markScheme, maxMarks, markPoints } = input;
+    const studentAnswer = String(input.studentAnswer ?? "");
+
+    const hasStructuredPoints = Array.isArray(markPoints) && markPoints.length > 0;
+
+    if (!studentAnswer || !studentAnswer.trim()) {
+      const emptyBreakdown = hasStructuredPoints
+        ? markPoints.map((mp: any) => ({
+            markPointId: mp.id || "MP",
+            awarded: 0,
+            maxMarks: mp.marks || 1,
+            criterion: mp.criterion || "",
+            reason: "No answer provided.",
+          }))
+        : [];
+
+      return ({
+        awardedMarks: 0,
+        maxMarks: maxMarks || 1,
+        feedback: "No answer provided.",
+        breakdown: emptyBreakdown,
+      });
+    }
+
+    const ai = getGeminiClient();
+    if (ai) {
+      if (hasStructuredPoints) {
+        const prompt = `You are ${IB_EXAMINER_ROLE}.
+You must grade the student's written response strictly and transparently against the individual markscheme points below, following IB marking practice.
+
+IB MARKING CONVENTIONS:
+- One mark per valid, distinct point unless the markscheme says otherwise; "[N max]" caps the marks. Credit equivalent wording and any valid point listed under "Accept"; never credit anything listed under "Do not accept".
+- The depth must match the IB command term in the question (State/Define/List need no explanation; Describe/Outline need a developed point; Explain/Compare/Justify need reasons; Evaluate/Discuss/To what extent need a balanced judgement and a conclusion).
+- For 6+ mark Discuss/Evaluate/To what extent questions with markbands, choose the best-fit band first, then the mark within it.
+- Answers about the case study or a given scenario must be applied to that context to earn development marks.
+- Do not penalise spelling or grammar unless it changes the meaning. Do not penalise the same error twice.
+Do NOT grade by loose overall keyword count or hallucinate external criteria. Assess each individual Mark Point independently.
+
+QUESTION:
+${question}
+
+MAX MARKS AVAILABLE: ${maxMarks || 2}
+
+STUDENT ANSWER:
+"${studentAnswer}"
+
+MARKSCHEME POINTS:
+${JSON.stringify(markPoints, null, 2)}
+${markScheme ? `\nMARKSCHEME NOTES:\n${markScheme}` : ""}
+
+EXAMINER MARKING RULES:
+1. Examine the student's answer for each Mark Point independently.
+2. For each Mark Point:
+   - Award up to the available marks for that point if the student explicitly or clearly conveys the stated criterion or any accepted/alternative answers.
+   - If the student misses the criterion, award 0.
+   - Provide a concise, professional 1-sentence reason explaining why this point was awarded or missed.
+3. Calculate "awardedMarks" as the sum of awarded marks across all mark points, capped at ${maxMarks || 2}.
+4. Provide constructive summary "feedback" explaining both strengths and missing concepts.
+
+Return strictly a JSON object:
+{
+  "awardedMarks": number,
+  "breakdown": [
+    {
+      "markPointId": "string (e.g. MP1)",
+      "awarded": number (from 0 to maxMarks for this mark point),
+      "maxMarks": number,
+      "criterion": "string (the criterion statement)",
+      "reason": "string (1 concise sentence explaining why awarded or missed)"
+    }
+  ],
+  "feedback": "string (summary feedback)"
+}`;
+
+        const response = await generateContentWithResilience(ai, {
+          contents: prompt,
+          config: { responseMimeType: "application/json" },
+        });
+
+        const parsed = JSON.parse(response.text?.trim() || "{}");
+        const breakdown = Array.isArray(parsed.breakdown) ? parsed.breakdown : [];
+        const awarded = typeof parsed.awardedMarks === "number"
+          ? parsed.awardedMarks
+          : breakdown.reduce((acc: number, item: any) => acc + (item.awarded || 0), 0);
+
+        return ({
+          awardedMarks: Math.min(maxMarks || 2, Math.max(0, awarded)),
+          maxMarks: maxMarks || 2,
+          feedback: parsed.feedback || "Evaluated against official mark points.",
+          breakdown,
+        });
+      } else {
+        const prompt = `You are ${IB_EXAMINER_ROLE}.
+Grade the student's answer against the markscheme strictly, accurately, and fairly, following IB marking practice.
+
+IB MARKING CONVENTIONS:
+- One mark per valid, distinct point unless the markscheme says otherwise; "[N max]" caps the marks. Credit equivalent wording and any valid point listed under "Accept"; never credit anything listed under "Do not accept".
+- The depth must match the IB command term in the question (State/Define/List need no explanation; Describe/Outline need a developed point; Explain/Compare/Justify need reasons; Evaluate/Discuss/To what extent need a balanced judgement and a conclusion).
+- For 6+ mark Discuss/Evaluate/To what extent questions with markbands, choose the best-fit band first, then the mark within it.
+- Answers about the case study or a given scenario must be applied to that context to earn development marks.
+- Do not penalise spelling or grammar unless it changes the meaning. Do not penalise the same error twice.
+
+QUESTION:
+${question}
+
+MARK SCHEME / RUBRIC:
+${markScheme}
+
+MAX MARKS: ${maxMarks || 2}
+
+STUDENT ANSWER:
+${studentAnswer}
+
+Return strictly a JSON object:
+{
+  "awardedMarks": number (from 0 to ${maxMarks || 2}),
+  "feedback": "Concise 1-2 sentence explanation of why marks were awarded or deducted",
+  "points": [ { "point": "one creditable point from the mark scheme (one entry per mark available)", "awarded": number, "max": number, "reason": "short reason" } ],
+  "keyPointsMatched": ["list of mark scheme points the student earned"],
+  "missingPoints": ["list of mark scheme points the student missed"]
+}`;
+
+        const response = await generateContentWithResilience(ai, {
+          contents: prompt,
+          config: { responseMimeType: "application/json" },
+        });
+
+        const parsed = JSON.parse(response.text?.trim() || "{}");
+        return ({
+          awardedMarks: Math.min(maxMarks || 1, Math.max(0, parsed.awardedMarks ?? 0)),
+          maxMarks: maxMarks || 1,
+          feedback: parsed.feedback || "Evaluated by auto-marker.",
+          breakdown: Array.isArray(parsed.points) && parsed.points.length
+            ? parsed.points
+            : [
+                ...(parsed.keyPointsMatched || []).map((p: any) => ({ point: String(p), awarded: 1, max: 1 })),
+                ...(parsed.missingPoints || []).map((p: any) => ({ point: String(p), awarded: 0, max: 1 })),
+              ],
+        });
+      }
+    }
+
+    // Heuristic fallback if Gemini API is unavailable
+    if (hasStructuredPoints) {
+      const lower = studentAnswer.toLowerCase();
+      let totalEarned = 0;
+      const breakdown = markPoints.map((mp: any) => {
+        const critWords = (mp.criterion || "")
+          .toLowerCase()
+          .split(/[\s,;|]+/)
+          .filter((w: string) => w.length > 3);
+        const matches = critWords.filter((w: string) => lower.includes(w));
+        const passed = critWords.length > 0 && matches.length >= Math.min(2, Math.ceil(critWords.length / 2));
+        const pts = passed ? (mp.marks || 1) : 0;
+        totalEarned += pts;
+        return {
+          markPointId: mp.id || "MP",
+          awarded: pts,
+          maxMarks: mp.marks || 1,
+          criterion: mp.criterion,
+          reason: passed
+            ? `Identified key criteria: "${matches.slice(0, 3).join('", "')}".`
+            : `Missing required concept: ${mp.criterion}`,
+        };
+      });
+
+      return ({
+        awardedMarks: Math.min(maxMarks || 2, totalEarned),
+        maxMarks: maxMarks || 2,
+        feedback: `Evaluated against ${markPoints.length} marking points.`,
+        breakdown,
+      });
+    }
+
+    const lowerAns = studentAnswer.toLowerCase();
+    const keywords = (markScheme || "").toLowerCase().split(/[\s,;|]+/).filter((w: string) => w.length > 3);
+    let matches = 0;
+    for (const kw of keywords) {
+      if (lowerAns.includes(kw)) matches++;
+    }
+    const ratio = keywords.length ? Math.min(1, matches / Math.max(1, Math.ceil(keywords.length / 2))) : 0.5;
+    const awarded = Math.round(ratio * (maxMarks || 2));
+
+    return ({
+      awardedMarks: Math.max(0, Math.min(maxMarks || 2, awarded)),
+      maxMarks: maxMarks || 2,
+      feedback: `Marked by keyword criteria (${matches} key terms found).`,
+      breakdown: [],
+    });
+}
+
+app.post("/api/mark-written", async (req, res) => {
+  try {
+    const { question, studentAnswer, markScheme, maxMarks, markPoints } = req.body;
+    const result = await markWrittenAnswer({
+      question,
+      studentAnswer: typeof studentAnswer === "string" ? studentAnswer : JSON.stringify(studentAnswer ?? ""),
+      markScheme,
+      maxMarks,
+      markPoints,
+    });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to mark response" });
+  }
+});
+
+// ==========================================
+// MULTI-TEACHER AUTHENTICATION & PORTAL ENDPOINTS
+// ==========================================
+app.post("/api/teacher/register", requireTeacher, (req, res) => {
+  const { email, password, name, school, department, role } = req.body || {};
+  if (!email || !password || !name) {
+    res.status(400).json({ error: "Full name, email address, and password are required." });
+    return;
+  }
+
+  const cleanEmail = String(email).trim().toLowerCase();
+  if (cleanEmail.length < 4 || !cleanEmail.includes("@")) {
+    res.status(400).json({ error: "Please provide a valid teacher email address." });
+    return;
+  }
+
+  if (String(password).length < 5) {
+    res.status(400).json({ error: "Teacher password must be at least 5 characters long." });
+    return;
+  }
+
+  // Check if email already registered
+  const existing = Object.values(teachersDb).find(
+    (t) => t.email.toLowerCase() === cleanEmail
+  );
+  if (existing) {
+    res.status(409).json({ error: "A teacher account with this email address already exists." });
+    return;
+  }
+
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = hashTeacherPassword(String(password), salt);
+  const teacherId =
+    "t_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 6);
+  const colors = ["purple", "indigo", "blue", "teal", "emerald", "amber", "rose"];
+  const avatarColor = colors[Math.floor(Math.random() * colors.length)];
+
+  const newTeacher: TeacherRecord = {
+    id: teacherId,
+    email: cleanEmail,
+    name: String(name).trim(),
+    school: String(school || IB_SCHOOL).trim(),
+    department: String(department || "Computer Science").trim(),
+    role: role || "teacher",
+    avatarColor,
+    createdAt: Date.now(),
+    salt,
+    hash,
+  };
+
+  teachersDb[teacherId] = newTeacher;
+  savePersistedTeachers();
+
+  const token = issueTeacherToken(teacherId);
+  const { salt: _s, hash: _h, ...profile } = newTeacher;
+  res.json({ success: true, token, teacher: profile });
+});
+
+// ==========================================
+// TEACHER ACCOUNTS (colleagues)
+// ==========================================
+/** Passcode-only login identifies the teacher by passcode, so passcodes must be unique. */
+function passcodeInUse(passcode: string, exceptId?: string): boolean {
+  return Object.values(teachersDb).some(
+    (t) => t.id !== exceptId && hashTeacherPassword(passcode, t.salt) === t.hash
+  );
+}
+
+app.get("/api/teachers", requireTeacher, (req, res) => {
+  const me = getTeacherFromRequest(req);
+  const teachers = Object.values(teachersDb)
+    .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+    .map((t) => ({ id: t.id, name: t.name, email: t.email, createdAt: t.createdAt, isMe: t.id === me?.id }));
+  res.json({ teachers });
+});
+
+app.post("/api/teachers", requireTeacher, (req, res) => {
+  const { name, passcode, email } = req.body || {};
+  const cleanName = String(name || "").trim();
+  const cleanPass = String(passcode || "");
+  if (cleanName.length < 2) {
+    res.status(400).json({ error: "Please enter your colleague's name." });
+    return;
+  }
+  if (cleanPass.length < 5) {
+    res.status(400).json({ error: "The passcode must be at least 5 characters long." });
+    return;
+  }
+  if (passcodeInUse(cleanPass)) {
+    res.status(409).json({ error: "That passcode is already used by another teacher. Please choose a different one." });
+    return;
+  }
+  let cleanEmail = String(email || "").trim().toLowerCase();
+  if (cleanEmail && (!cleanEmail.includes("@") || cleanEmail.length < 4)) {
+    res.status(400).json({ error: "Please enter a valid email address, or leave it blank." });
+    return;
+  }
+  if (!cleanEmail) {
+    // Email is optional; accounts need a unique one internally
+    const slug = cleanName.toLowerCase().replace(/[^a-z0-9]+/g, ".").replace(/^\.|\.$/g, "") || "teacher";
+    cleanEmail = `${slug}.${Date.now().toString(36)}@teachers.local`;
+  }
+  if (Object.values(teachersDb).some((t) => t.email.toLowerCase() === cleanEmail)) {
+    res.status(409).json({ error: "A teacher account with this email address already exists." });
+    return;
+  }
+
+  const salt = crypto.randomBytes(16).toString("hex");
+  const teacherId = "t_" + Date.now().toString(36) + "_" + Math.random().toString(36).substring(2, 6);
+  const colors = ["purple", "indigo", "blue", "teal", "emerald", "amber", "rose"];
+  teachersDb[teacherId] = {
+    id: teacherId,
+    email: cleanEmail,
+    name: cleanName,
+    school: IB_SCHOOL,
+    department: "Computer Science",
+    role: "teacher",
+    avatarColor: colors[Math.floor(Math.random() * colors.length)],
+    createdAt: Date.now(),
+    salt,
+    hash: hashTeacherPassword(cleanPass, salt),
+  } as TeacherRecord;
+  savePersistedTeachers();
+  res.json({ success: true, teacher: { id: teacherId, name: cleanName, email: cleanEmail } });
+});
+
+app.delete("/api/teachers/:id", requireTeacher, (req, res) => {
+  const me = getTeacherFromRequest(req);
+  const id = String(req.params.id);
+  if (!teachersDb[id]) {
+    res.status(404).json({ error: "Teacher not found." });
+    return;
+  }
+  if (id === me?.id) {
+    res.status(400).json({ error: "You can't remove your own account." });
+    return;
+  }
+  // Their assessments and results are kept; they just can't log in any more.
+  delete teachersDb[id];
+  savePersistedTeachers();
+  res.json({ success: true });
+});
+
+function matchTeacherCredentials(db: Record<string, any>, email: any, password: any, passcode: any): any | null {
+  const check = (t: any, secret: string) => {
+    try {
+      if (!t || !t.salt || !t.hash) return false;
+      const computed = hashTeacherPassword(secret, t.salt);
+      return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(t.hash));
+    } catch {
+      return false;
+    }
+  };
+  if (email && password) {
+    const cleanEmail = String(email).trim().toLowerCase();
+    const t = Object.values(db).find((x: any) => String(x?.email || "").toLowerCase() === cleanEmail);
+    return t && check(t, String(password)) ? t : null;
+  }
+  const candidate = passcode || password;
+  if (!candidate || typeof candidate !== "string") return null;
+  return Object.values(db).find((t: any) => check(t, candidate)) || null;
+}
+
+// Copies everything from the previous database once (shared by the button and by login)
+let migrationInFlight: Promise<any> | null = null;
+async function runMigrationOnce(): Promise<any> {
+  if (migrationInFlight) return migrationInFlight;
+  migrationInFlight = (async () => {
+    const marker = await getMigrationMarker();
+    if (marker) return { alreadyDone: true, marker };
+    const result = await copyFromPreviousDatabase(MIGRATED_COLLECTIONS);
+    await setMigrationMarker({ at: Date.now(), copied: result.copied, source: result.source });
+    await pullSharedState("all");
+    return result;
+  })().finally(() => {
+    migrationInFlight = null;
+  });
+  return migrationInFlight;
+}
+
+// Before the data has been copied to the new database, the teacher's existing passwords
+// still work: they are checked against the previous database, and a correct one brings
+// all the data across straight away.
+async function loginWithPreviousDatabase(email: any, password: any, passcode: any): Promise<any | null> {
+  try {
+    if (!isSharedStoreEnabled() || !hasPreviousDatabase()) return null;
+    if (await getMigrationMarker()) return null;
+    const prevTeachers = await readPreviousCollection("teachers");
+    const t = matchTeacherCredentials(prevTeachers, email, password, passcode);
+    if (!t) return null;
+    await runMigrationOnce();
+    return teachersDb[t.id] || t;
+  } catch (err) {
+    console.error("[migration] Login with previous database failed:", err);
+    return null;
+  }
+}
+
+// Lets the teacher address check that the student address is this same app
+app.get("/api/site-check", (_req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.json({ app: "ib-dp-cs" });
+});
+
+// Slow down password guessing: after a few wrong teacher passwords from one address, every
+// further attempt waits longer (up to 15 s). A correct sign-in resets it.
+const loginFailures = new Map<string, { n: number; at: number }>();
+function loginClientKey(req: express.Request) {
+  return String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "?").split(",")[0].trim();
+}
+app.use("/api/teacher/login", async (req, res, next) => {
+  if (req.method !== "POST") return next();
+  const key = loginClientKey(req);
+  const rec = loginFailures.get(key);
+  if (rec && Date.now() - rec.at > 30 * 60 * 1000) loginFailures.delete(key);
+  const fails = loginFailures.get(key)?.n || 0;
+  if (fails >= 3) await new Promise((r) => setTimeout(r, Math.min(15, (fails - 2) * 3) * 1000));
+  res.on("finish", () => {
+    if (res.statusCode === 401) {
+      const r = loginFailures.get(key) || { n: 0, at: Date.now() };
+      loginFailures.set(key, { n: r.n + 1, at: Date.now() });
+    } else if (res.statusCode < 300) loginFailures.delete(key);
+  });
+  next();
+});
+
+app.post("/api/teacher/login", async (req, res) => {
+  const { email, password, passcode } = req.body || {};
+
+  const local = matchTeacherCredentials(teachersDb, email, password, passcode);
+  if (!local) {
+    const migrated = await loginWithPreviousDatabase(email, password, passcode);
+    if (migrated) {
+      const token = issueTeacherToken(migrated.id);
+      const { salt: _s, hash: _h, ...profile } = migrated;
+      res.json({ success: true, token, teacher: profile, migrated: true });
+      return;
+    }
+  }
+
+  // Mode 1: Individual Teacher Account (Email + Password)
+  if (email && password) {
+    const cleanEmail = String(email).trim().toLowerCase();
+    const teacher = Object.values(teachersDb).find(
+      (t) => t.email.toLowerCase() === cleanEmail
+    );
+    if (!teacher) {
+      res.status(401).json({ error: "No teacher account registered with this email address." });
+      return;
+    }
+
+    const computed = hashTeacherPassword(String(password), teacher.salt);
+    const valid = crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(teacher.hash));
+    if (!valid) {
+      res.status(401).json({ error: "Incorrect password for this teacher account." });
+      return;
+    }
+
+    const token = issueTeacherToken(teacher.id);
+    const { salt: _s, hash: _h, ...profile } = teacher;
+    res.json({ success: true, token, teacher: profile });
+    return;
+  }
+
+  // Mode 2: Quick Passcode / Master PIN unlock
+  const candidate = passcode || password;
+  if (!candidate || typeof candidate !== "string") {
+    res.status(400).json({ error: "Teacher email & password or passcode is required." });
+    return;
+  }
+
+  // Check across registered teachers (matches default teacher or any staff PIN)
+  for (const t of Object.values(teachersDb)) {
+    try {
+      const computed = hashTeacherPassword(candidate, t.salt);
+      if (crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(t.hash))) {
+        const token = issueTeacherToken(t.id);
+        const { salt: _s, hash: _h, ...profile } = t;
+        res.json({ success: true, token, teacher: profile });
+        return;
+      }
+    } catch (e) {}
+  }
+
+  res.status(401).json({ error: "Invalid teacher passcode or credentials. Access denied." });
+});
+
+app.get("/api/teacher/me", requireTeacher, (req, res) => {
+  const teacher = (req as any).teacher;
+  res.json({ teacher });
+});
+
+app.get("/api/teacher/verify", (req, res) => {
+  const teacher = getTeacherFromRequest(req);
+  if (teacher) {
+    res.json({ authenticated: true, teacher });
+  } else {
+    res.status(401).json({ authenticated: false, error: "Invalid or expired teacher session." });
+  }
+});
+
+app.get("/api/teachers", requireTeacher, (req, res) => {
+  const faculty = Object.values(teachersDb).map(({ salt, hash, ...profile }) => profile);
+  res.json({ teachers: faculty });
+});
+
+app.post("/api/teacher/logout", (req, res) => {
+  const token = extractToken(req);
+  if (token) {
+    activeTeacherTokens.delete(token);
+  }
+  res.json({ success: true });
+});
+
+app.post("/api/teacher/change-password", requireTeacher, (req, res) => {
+  const { oldPasscode, newPasscode } = req.body || {};
+  if (!oldPasscode || !newPasscode) {
+    res.status(400).json({ error: "Both current and new passwords are required." });
+    return;
+  }
+
+  const currentTeacherProfile = (req as any).teacher as TeacherProfile;
+  const currentRecord = teachersDb[currentTeacherProfile.id];
+  if (!currentRecord) {
+    res.status(404).json({ error: "Teacher record not found." });
+    return;
+  }
+
+  const computedOld = hashTeacherPassword(oldPasscode, currentRecord.salt);
+  if (!crypto.timingSafeEqual(Buffer.from(computedOld), Buffer.from(currentRecord.hash))) {
+    res.status(403).json({ error: "Current password is incorrect." });
+    return;
+  }
+
+  if (typeof newPasscode !== "string" || newPasscode.length < 5) {
+    res.status(400).json({ error: "New password must be at least 5 characters long." });
+    return;
+  }
+
+  const newSalt = crypto.randomBytes(16).toString("hex");
+  if (passcodeInUse(newPasscode, currentRecord.id)) {
+    res.status(409).json({ error: "That passcode is already used by another teacher. Please choose a different one." });
+    return;
+  }
+  const newHash = hashTeacherPassword(newPasscode, newSalt);
+  currentRecord.salt = newSalt;
+  currentRecord.hash = newHash;
+  savePersistedTeachers();
+
+  // Old tokens stop working after a password change, so hand back a fresh one.
+  res.json({
+    success: true,
+    token: issueTeacherToken(currentRecord.id),
+    message: "Teacher password successfully updated and hashed.",
+  });
+});
+
+// ==========================================
+// TEACHER QUESTION & AUTO MARK SCHEME GENERATOR
+// ==========================================
+app.post("/api/teacher/generate-mark-scheme", requireTeacher, async (req, res) => {
+  try {
+    const {
+      title,
+      brief,
+      marks = 4,
+      unit = "B2",
+      type = "code",
+      level = "Core",
+      starterCode,
+    } = req.body || {};
+
+    if (!brief || !String(brief).trim()) {
+      res.status(400).json({
+        error: "Please enter the question brief or problem description.",
+      });
+      return;
+    }
+
+    const teacher = (req as any).teacher as TeacherProfile;
+    const targetMarks = Math.max(1, Number(marks) || 4);
+    const ai = getGeminiClient();
+
+    if (ai) {
+      try {
+        const prompt = `You are ${IB_EXAMINER_ROLE}.
+A teacher has added a new question prompt and requires you to formulate:
+1. An IB-style markscheme
+2. A clean, working reference solution in Python 3
+3. A robust auto-grading test suite that strictly prevents hardcoding while being method-agnostic.
+
+TEACHER INPUTS:
+Question Title: ${title || "Computer Science Task"}
+IB Topic: ${ibUnitTitle(isIBUnitCode(unit) ? unit : classifyIBTopic(String(brief)))}
+Target Marks: ${targetMarks} Marks
+Question Type: ${type}
+Cognitive Level: ${level}
+Question Prompt / Brief:
+${brief}
+
+${starterCode ? `Teacher's Optional Starter Code:\n${starterCode}\n` : ""}
+
+CRITICAL SPECIFICATION REQUIREMENTS:
+1. IB MARKSCHEME:
+   - Provide IB-style marking points ("Award [1] for ...", one mark per correct element of the algorithm/program, with Accept / Do not accept notes) totaling exactly ${targetMarks} marks.
+   - Explicitly note: "Any valid programming approach (while loops, for loops, list comprehension, recursion, built-in functions) that calculates the correct output MUST be awarded full marks."
+2. WORKING REFERENCE SOLUTION:
+   - Must be clean, syntax-error-free, functional Python 3 code in "solution".
+3. COMPREHENSIVE AUTO-GRADING TEST SUITE (ANTI-HARDCODING GUARANTEE):
+   - Provide 4 to 6 diverse test cases:
+     a) Normal typical inputs
+     b) Boundary/edge cases (e.g. 0, negatives, exact thresholds like >= 50, maximum values, empty/single elements)
+     c) Validation / extreme values
+     d) Ensure test cases have different input-output pairs so that any hardcoded static print statements or lookup tables fail!
+   - Test case format: { "in": string[] (array of stdin lines), "out": string (stdout ending with \\n), "m": number (mark weighting) }
+   - The sum of test marks "m" MUST equal ${targetMarks}.
+4. PEDAGOGICAL HINT:
+   - Provide guidance without revealing the complete solution.
+5. IB DP COMPUTER SCIENCE SCOPE:
+${ibExaminerContext({ includeScope: false })}
+   - If the brief prohibits a built-in function (e.g. "without using sort"), the solution must not use it; otherwise tests must pass for any correct approach.
+
+Respond STRICTLY with a valid JSON object only (no markdown, no backticks):
+{
+  "title": "${title || "Descriptive Title"}",
+  "markScheme": "IB-style markscheme: Award [1] for ... points, Accept / Do not accept notes and alternative-method acceptance notes",
+  "brief": "${brief.replace(/"/g, '\\"')}",
+  "starter": "# Starter Python code with comments",
+  "solution": "# Reference Python 3 solution",
+  "tests": [
+    { "in": ["input1"], "out": "output1\\n", "m": 1 },
+    { "in": ["input2"], "out": "output2\\n", "m": 1 },
+    { "in": ["boundary_in"], "out": "boundary_out\\n", "m": 1 },
+    { "in": ["edge_in"], "out": "edge_out\\n", "m": 1 }
+  ],
+  "hint": "Pedagogical hint for students",
+  "level": "${level}",
+  "marks": ${targetMarks}
+}`;
+
+        const response = await generateContentWithResilience(ai, {
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        const rawText = response.text?.trim() || "";
+        const cleanJson = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(cleanJson);
+
+        // Adjust test marks sum to equal targetMarks
+        if (Array.isArray(parsed.tests) && parsed.tests.length > 0) {
+          let currentSum = parsed.tests.reduce(
+            (acc: number, t: any) => acc + (Number(t.m) || 1),
+            0
+          );
+          if (currentSum !== targetMarks) {
+            const diff = targetMarks - currentSum;
+            parsed.tests[parsed.tests.length - 1].m = Math.max(
+              1,
+              (parsed.tests[parsed.tests.length - 1].m || 1) + diff
+            );
+          }
+        }
+
+        parsed.unit = isIBUnitCode(unit) ? unit : classifyIBTopic(String(brief));
+        parsed.unitName = ibUnitTitle(parsed.unit);
+        parsed.type = type;
+        parsed.marks = targetMarks;
+        parsed.authorId = teacher.id;
+        parsed.authorName = teacher.name;
+        parsed.authorSchool = teacher.school;
+
+        res.json({ success: true, data: parsed });
+        return;
+      } catch (aiErr) {
+        console.error("Gemini mark scheme generator error, falling back to rule-based:", aiErr);
+      }
+    }
+
+    // Rule-based fallback generator
+    const fallback = generateRuleBasedMarkSchemeAndTests({
+      title,
+      brief,
+      marks: targetMarks,
+      unit,
+      type,
+      level,
+      starterCode,
+      teacher,
+    });
+    res.json({ success: true, data: fallback });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to generate mark scheme" });
+  }
+});
+
+function generateRuleBasedMarkSchemeAndTests(params: {
+  title?: string;
+  brief: string;
+  marks: number;
+  unit: string;
+  type: string;
+  level: string;
+  starterCode?: string;
+  teacher?: TeacherProfile;
+}) {
+  const {
+    title = "Python Programming Problem",
+    brief,
+    marks = 4,
+    unit = "B2",
+    level = "Core",
+    starterCode,
+    teacher,
+  } = params;
+  const targetMarks = Math.max(1, marks);
+
+  const markScheme = `IB DP Computer Science markscheme
+Paper 2: Computational thinking and problem-solving (Python)
+Total: [${targetMarks}]
+
+MARKING POINTS:
+• Award [1] for a valid algorithmic structure (input, iteration or selection as required).
+• Award [1] for correct variable manipulation, calculation and data type handling.
+• Award [1] for output in the specified format.
+
+SPECIFICATION METHOD-AGNOSTIC PRINCIPLE:
+Any valid programming technique that produces the specified outcome must be credited with full marks, unless the question prohibits a specific built-in function (e.g. sort, max, min).
+
+ANTI-HARDCODING DIRECTIVE:
+All solutions must read dynamic inputs and process variables. Solutions that output hardcoded constants without reading inputs will be awarded 0 marks.`;
+
+  const qMarksPerTest = Math.max(1, Math.floor(targetMarks / 4));
+  const remainder = targetMarks - qMarksPerTest * 3;
+
+  return {
+    title: title || "Custom Programming Challenge",
+    brief: brief.trim(),
+    starter:
+      starterCode ||
+      "# Write your Python 3 solution here\n# Remember to read input() dynamically\n",
+    solution: `# Model Reference Solution\nimport sys\n\ntry:\n    # Read inputs\n    lines = [line.strip() for line in sys.stdin if line.strip()]\n    if lines:\n        nums = [float(x) if '.' in x else int(x) for x in lines if x.replace('-', '').isdigit()]\n        if nums:\n            print(sum(nums))\n        else:\n            print(lines[0])\nexcept Exception as e:\n    pass\n`,
+    markScheme,
+    hint: "Analyze the required input format and break the problem down into input collection, processing, and output.",
+    level,
+    marks: targetMarks,
+    unit,
+    type: "code",
+    authorId: teacher?.id,
+    authorName: teacher?.name,
+    authorSchool: teacher?.school,
+    tests: [
+      { in: ["10", "20"], out: "30\n", m: qMarksPerTest },
+      { in: ["5", "15"], out: "20\n", m: qMarksPerTest },
+      { in: ["0", "0"], out: "0\n", m: qMarksPerTest },
+      { in: ["50", "150"], out: "200\n", m: Math.max(1, remainder) },
+    ],
+  };
+}
+
+// Helper to ensure assessment returns the most up-to-date question definitions
+// ---------- Questions replaced after students had answered them ----------
+// Editing an assessment never deletes students' work: answers and marks for a question
+// that was taken out stay with the student, and are shown and counted as "replaced questions".
+function findQuestionDefinition(a: AssessmentStore, id: string): any | null {
+  const retired = (a as any).retiredQuestions || {};
+  return retired[id] || customQuestionsDb[id] || ALL_BUILTIN_TASKS[id] || null;
+}
+
+function isBlankAnswer(v: any): boolean {
+  if (v === undefined || v === null) return true;
+  if (typeof v === "string") return !v.trim();
+  if (Array.isArray(v)) return v.length === 0 || v.every((x) => isBlankAnswer(x));
+  if (typeof v === "object") return Object.values(v).every((x) => isBlankAnswer(x));
+  return false;
+}
+
+/** Replaced questions this student answered (definition may be null if it can no longer be found). */
+function replacedQuestionsFor(a: AssessmentStore, s: any): Array<{ id: string; task: any | null }> {
+  const current = new Set(a.questionIds || []);
+  const out: Array<{ id: string; task: any | null }> = [];
+  for (const [qid, v] of Object.entries(s?.answers || {})) {
+    if (current.has(qid) || isBlankAnswer(v)) continue;
+    out.push({ id: qid, task: findQuestionDefinition(a, qid) });
+  }
+  return out;
+}
+
+function enrichAssessment(a: AssessmentStore): AssessmentStore {
+  if (!a) return a;
+  const questionMap: Record<string, any> = {};
+
+  // 1. Base built-in tasks from curriculum repositories
+  for (const qId of a.questionIds || []) {
+    if (ALL_BUILTIN_TASKS[qId]) {
+      questionMap[qId] = { ...ALL_BUILTIN_TASKS[qId] };
+    }
+  }
+
+  // 2. Existing stored questions on assessment
+  if (a.questions && Array.isArray(a.questions)) {
+    for (const q of a.questions) {
+      if (q && q.id) {
+        questionMap[q.id] = { ...(questionMap[q.id] || {}), ...q };
+      }
+    }
+  }
+
+  // 3. Overlay any latest edits from customQuestionsDb
+  for (const qId of a.questionIds || []) {
+    if (customQuestionsDb[qId]) {
+      questionMap[qId] = { ...(questionMap[qId] || {}), ...customQuestionsDb[qId] };
+    }
+  }
+
+  const enrichedQuestions = (a.questionIds || []).map((id) => questionMap[id]).filter(Boolean);
+  if (enrichedQuestions.length > 0) {
+    return { ...a, questions: enrichedQuestions };
+  }
+  return a;
+}
+
+// ==========================================
+// SERVER-AUTHORITATIVE TASK AUTO-MARKER
+// Evaluates submissions securely without exposing mark schemes to students
+// ==========================================
+// ==========================================
+// MARK-SCHEME AWARE MARKING HELPERS
+// ==========================================
+
+/** Collects every bit of mark scheme information a question carries (including sub-parts). */
+function collectMarkScheme(task: any): { text: string; markPoints: any[] } {
+  const lines: string[] = [];
+  const markPoints: any[] = Array.isArray(task.markPoints) ? [...task.markPoints] : [];
+  if (task.markScheme) lines.push(String(task.markScheme));
+  for (const q of Array.isArray(task.questions) ? task.questions : []) {
+    if (q && Array.isArray(q.criteria) && q.criteria.length) lines.push(q.criteria.join("; "));
+    else if (q && Array.isArray(q.keywords) && q.keywords.length) lines.push("Key terms: " + q.keywords.join(", "));
+  }
+  for (const part of Array.isArray(task.parts) ? task.parts : []) {
+    if (!part) continue;
+    const label = part.label || part.id || "Part";
+    if (part.markScheme) lines.push(`${label}: ${part.markScheme}`);
+    if (Array.isArray(part.markPoints)) {
+      for (const mp of part.markPoints) markPoints.push({ ...mp, id: `${label} ${mp.id || "MP"}` });
+    }
+  }
+  return { text: lines.join("\n"), markPoints };
+}
+
+function describeQuestion(task: any): string {
+  const pieces: string[] = [task.title ? `${task.title}` : "", task.brief || ""];
+  for (const part of Array.isArray(task.parts) ? task.parts : []) {
+    if (part) pieces.push(`${part.label || ""} ${part.question || ""} (${part.marks || 0} marks)`);
+  }
+  if (task.code) pieces.push("Code provided to candidates:\n" + task.code);
+  return pieces.filter(Boolean).join("\n\n");
+}
+
+function answerToText(ans: any): string {
+  if (ans === null || ans === undefined) return "";
+  if (typeof ans === "string") return ans;
+  if (Array.isArray(ans)) return ans.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join("\n");
+  if (typeof ans === "object") {
+    return Object.entries(ans)
+      .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+      .join("\n");
+  }
+  return String(ans);
+}
+
+function hasMarkSchemeInfo(task: any): boolean {
+  const ms = collectMarkScheme(task);
+  return Boolean(ms.text.trim() || ms.markPoints.length || task.solution);
+}
+
+// ---------- Python execution that also works on Vercel ----------
+// Vercel's Node.js runtime has no python3, so on Vercel we call the small Python
+// function in api/run_python.py instead. If neither is available we fall back to AI.
+let localPythonAvailable: boolean | null = null;
+
+function pythonRunnerUrl(): string | null {
+  if (process.env.PYTHON_RUNNER_URL) return process.env.PYTHON_RUNNER_URL;
+  const host =
+    process.env.VERCEL_ENV === "production" && process.env.VERCEL_PROJECT_PRODUCTION_URL
+      ? process.env.VERCEL_PROJECT_PRODUCTION_URL
+      : process.env.VERCEL_URL;
+  return host ? `https://${host}/api/run_python` : null;
+}
+
+async function runPythonTests(
+  code: string,
+  inputsList: string[][],
+  files: Record<string, string> = VIRTUAL_FILES
+): Promise<Array<{ out: string; err: string | null }> | null> {
+  if (localPythonAvailable !== false) {
+    const results: Array<{ out: string; err: string | null }> = [];
+    for (const inputs of inputsList) {
+      const r = await executePythonCode(code, inputs, files);
+      if (r.err && /ENOENT|spawn python3/i.test(r.err)) {
+        localPythonAvailable = false;
+        break;
+      }
+      localPythonAvailable = true;
+      results.push(r);
+    }
+    if (localPythonAvailable) return results;
+  }
+
+  const url = pythonRunnerUrl();
+  if (!url) return null;
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "x-runner-secret": getTokenSecret(),
+    };
+    if (process.env.VERCEL_AUTOMATION_BYPASS_SECRET) {
+      headers["x-vercel-protection-bypass"] = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    }
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ code, tests: inputsList, files }),
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!resp.ok) {
+      console.warn("[python] Remote runner returned", resp.status);
+      return null;
+    }
+    const data: any = await resp.json();
+    return Array.isArray(data.results) ? data.results : null;
+  } catch (e) {
+    console.warn("[python] Remote runner unavailable:", e);
+    return null;
+  }
+}
+
+/** Uses Gemini to mark a code answer against the mark scheme, tests and model solution. */
+async function markCodeWithAI(
+  task: any,
+  code: string,
+  maxMarks: number,
+  testResultsText = ""
+): Promise<{ m: number; feedback: string; points?: MarkPoint[] } | null> {
+  const ai = getGeminiClient();
+  if (!ai) return null;
+  const ms = collectMarkScheme(task);
+  const prompt = `You are ${IB_EXAMINER_ROLE}, marking a Python 3 programming answer (IB Paper 2 style).
+Mark strictly against the markscheme. If mark points are given, assess each one independently ("Award [1] for ..." = one mark for each correct element of the algorithm or program).
+Minor syntax slips that do not change the logic are not penalised unless the question is about syntax. If the question prohibits a built-in function (e.g. sort, max, min), do not award the marks that the prohibited function would earn.
+${task.ibLevel === "HL" ? "This is HL content." : "This is SL content: do not expect HL-only techniques (recursion, multiple-class OOP, B4 ADTs), but credit them if they work."}
+Where test cases are given, mentally trace the candidate's program with each input and compare the output.
+Award credit for working alternative solutions that meet the mark scheme. Never award marks for code that only prints hard-coded expected outputs.
+
+QUESTION:
+${describeQuestion(task)}
+
+MAXIMUM MARKS: ${maxMarks}
+
+MARK SCHEME:
+${ms.text || "(none supplied)"}
+
+MARK POINTS:
+${ms.markPoints.length ? JSON.stringify(ms.markPoints, null, 2) : "(none supplied)"}
+
+TEST CASES (inputs -> expected output):
+${Array.isArray(task.tests) && task.tests.length ? JSON.stringify(task.tests, null, 2) : "(none supplied)"}
+
+MODEL SOLUTION (for reference only):
+${task.solution || "(none supplied)"}
+
+DATA FILES THE PROGRAM CAN OPEN:
+${
+  task.dataFiles && Object.keys(task.dataFiles).length
+    ? Object.entries(task.dataFiles)
+        .map(([n, c]) => `--- ${n} ---\n${String(c).slice(0, 4000)}`)
+        .join("\n")
+    : "(see question)"
+}
+
+CANDIDATE'S CODE:
+\`\`\`python
+${code}
+\`\`\`
+${testResultsText ? "\nWHAT THE CANDIDATE'S PROGRAM ACTUALLY PRINTED WHEN RUN:\n" + testResultsText + "\n" : ""}
+List every creditable mark point (use the given mark points; otherwise split the mark scheme into one point per mark, ${maxMarks} in total) and decide each one for THIS code.
+
+Return strictly a JSON object:
+{
+  "awardedMarks": number (0 to ${maxMarks}, the sum of awarded points),
+  "feedback": "2-4 sentences addressed to the student ('you'): what is done well, exactly what is wrong (name the line or logic), and how to fix it",
+  "points": [ { "point": "short description of the mark point", "awarded": number, "max": number, "reason": "short reason, only if not awarded" } ]
+}`;
+
+  try {
+    const response = await generateContentWithResilience(ai, {
+      contents: prompt,
+      config: { responseMimeType: "application/json" },
+    });
+    const parsed = JSON.parse(response.text?.trim() || "{}");
+    const points = normalizeMarkPoints(parsed.points);
+    let m = Math.max(0, Math.min(maxMarks, Math.round(Number(parsed.awardedMarks) || 0)));
+    if (points.length && !(Number(parsed.awardedMarks) >= 0)) {
+      m = Math.min(maxMarks, Math.round(points.reduce((acc, p) => acc + p.awarded, 0)));
+    }
+    return { m, feedback: String(parsed.feedback || "").trim(), points };
+  } catch (e) {
+    console.warn("[marking] AI code marking failed:", e);
+    return null;
+  }
+}
+
+/** One line of "where marks were gained and lost". */
+interface MarkPoint {
+  point: string;
+  awarded: number;
+  max: number;
+  reason?: string;
+}
+
+function normalizeMarkPoints(raw: any): MarkPoint[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((p: any) => {
+      if (!p) return null;
+      if (typeof p === "string") return { point: p, awarded: 0, max: 1 };
+      const point = String(p.point ?? p.criterion ?? p.description ?? p.text ?? p.markPointId ?? "").trim();
+      if (!point) return null;
+      const max = Math.max(0, Number(p.max ?? p.maxMarks ?? p.marks ?? 1) || 0);
+      const awarded = Math.max(0, Math.min(max || 1, Number(p.awarded ?? 0) || 0));
+      const reason = p.reason ? String(p.reason).trim() : undefined;
+      return { point: point.slice(0, 300), awarded, max: max || 1, ...(reason ? { reason: reason.slice(0, 300) } : {}) };
+    })
+    .filter(Boolean)
+    .slice(0, 20) as MarkPoint[];
+}
+
+/** Marks all questions in parallel (AI marking one-by-one could exceed the server time limit). */
+async function markAllQuestions(
+  questions: any[],
+  answers: Record<string, any>
+): Promise<{ marks: Record<string, number>; notes: Record<string, string>; total: number; points: Record<string, MarkPoint[]> }> {
+  const marks: Record<string, number> = {};
+  const notes: Record<string, string> = {};
+  const points: Record<string, MarkPoint[]> = {};
+  const list = questions.filter((q) => q && q.id);
+  const CONCURRENCY = 5;
+  let next = 0;
+  async function worker() {
+    while (next < list.length) {
+      const q = list[next++];
+      try {
+        const r = await autoMarkTaskOnServer(q, answers ? answers[q.id] : undefined);
+        marks[q.id] = r.m;
+        if (r.feedback) notes[q.id] = r.feedback;
+        if (r.points && r.points.length) points[q.id] = r.points;
+      } catch (e: any) {
+        console.warn("[marking] Failed to mark", q.id, e);
+        marks[q.id] = 0;
+        notes[q.id] = "Automatic marking failed for this question; please mark it manually.";
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, list.length) }, worker));
+  const total = Object.values(marks).reduce((acc, m) => acc + (m || 0), 0);
+  return { marks, notes, total, points };
+}
+
+interface CodeTestDetail {
+  inputs: string[];
+  output: string;
+  expected: string;
+  passed: boolean;
+  marks: number;
+  maxMarks: number;
+  error?: string;
+}
+
+async function autoMarkTaskOnServer(
+  task: any,
+  studentAns: any
+): Promise<{ m: number; feedback?: string; tests?: CodeTestDetail[]; points?: MarkPoint[] }> {
+  if (!task) return { m: 0 };
+  const maxMarks = task.marks || 1;
+
+  // 1. Multiple Choice (MCQ)
+  if (task.type === "mcq") {
+    const mcqs = task.questions || task.mcqs || [];
+    if (!mcqs.length) return { m: 0 };
+    let correct = 0;
+    const ansArray = Array.isArray(studentAns)
+      ? studentAns
+      : studentAns !== null && studentAns !== undefined
+      ? [studentAns]
+      : [];
+
+    const feedbackNotes: string[] = [];
+
+    for (let i = 0; i < mcqs.length; i++) {
+      const q = mcqs[i];
+      const given = ansArray[i];
+      const options: string[] = q.options || q.o || [];
+
+      if (given !== undefined && given !== null && String(given).trim() !== "") {
+        let isCorrect = false;
+
+        if (typeof q.a === "number") {
+          const numGiven = Number(given);
+          if (!isNaN(numGiven) && numGiven === q.a) {
+            isCorrect = true;
+          } else if (typeof given === "string") {
+            const cleanGiven = given.trim().toLowerCase();
+            // Match letter 'a', 'b', 'c', 'd'
+            if (cleanGiven.length === 1 && cleanGiven >= "a" && cleanGiven <= "z") {
+              const letterIndex = cleanGiven.charCodeAt(0) - 97;
+              if (letterIndex === q.a) isCorrect = true;
+            }
+            // Match literal option text e.g. "if" matching options[q.a]
+            if (!isCorrect && options[q.a] && options[q.a].trim().toLowerCase() === cleanGiven) {
+              isCorrect = true;
+            }
+          }
+        } else if (typeof q.a === "string") {
+          const cleanExp = q.a.trim().toLowerCase();
+          const cleanGiven = String(given).trim().toLowerCase();
+          if (cleanGiven === cleanExp) {
+            isCorrect = true;
+          } else {
+            const numGiven = Number(given);
+            if (!isNaN(numGiven) && options[numGiven] && options[numGiven].trim().toLowerCase() === cleanExp) {
+              isCorrect = true;
+            }
+            if (cleanExp.length === 1 && cleanExp >= "a" && cleanExp <= "z" && !isNaN(numGiven)) {
+              if (numGiven === cleanExp.charCodeAt(0) - 97) isCorrect = true;
+            }
+          }
+        }
+
+        if (isCorrect) {
+          correct++;
+        } else {
+          const chosenText =
+            typeof given === "number" && options[given]
+              ? `"${options[given]}"`
+              : !isNaN(Number(given)) && options[Number(given)]
+              ? `"${options[Number(given)]}"`
+              : `"${given}"`;
+          const correctText =
+            typeof q.a === "number" && options[q.a]
+              ? `"${options[q.a]}"`
+              : !isNaN(Number(q.a)) && options[Number(q.a)]
+              ? `"${options[Number(q.a)]}"`
+              : `"${q.a}"`;
+          feedbackNotes.push(`Q${i + 1}: Selected ${chosenText}, expected ${correctText}`);
+        }
+      } else {
+        feedbackNotes.push(`Q${i + 1}: No answer selected`);
+      }
+    }
+
+    // Tick tables from past papers carry the official rule, e.g. [2,4,5]:
+    // 2 correct rows = 1 mark, 4 = 2 marks, 5 = 3 marks.
+    const thresholds: number[] = Array.isArray(task.markThresholds) ? task.markThresholds : [];
+    const awarded = thresholds.length
+      ? thresholds.filter((needed) => correct >= needed).length
+      : Math.round((correct / mcqs.length) * maxMarks);
+    return {
+      m: Math.min(maxMarks, awarded),
+      feedback: feedbackNotes.length === 0 ? "Correct selection." : feedbackNotes.join("; "),
+    };
+  }
+
+  // 2. Code Inspection / Exact Short Answer
+  if (task.type === "inspect") {
+    const subQs = task.questions || task.subQuestions || [];
+    if (!subQs.length) return { m: 0 };
+    let correct = 0;
+    let ansArray: any[] = [];
+    if (Array.isArray(studentAns)) {
+      ansArray = studentAns;
+    } else if (typeof studentAns === "object" && studentAns !== null) {
+      ansArray = subQs.map((sq: any, idx: number) => studentAns[sq.id] ?? studentAns[idx] ?? "");
+    } else if (studentAns !== undefined && studentAns !== null) {
+      ansArray = [studentAns];
+    }
+
+    const feedbackNotes: string[] = [];
+    for (let i = 0; i < subQs.length; i++) {
+      const sq = subQs[i];
+      const given = normalizeStringAnswer(ansArray[i]);
+      const acceptedList = Array.isArray(sq.a)
+        ? sq.a
+        : typeof sq.a === "string"
+        ? sq.a.split("|")
+        : Array.isArray(sq.accepted)
+        ? sq.accepted
+        : [];
+      const matches = acceptedList.some((acc: string) => normalizeStringAnswer(acc) === given);
+      if (matches) {
+        correct++;
+      } else {
+        feedbackNotes.push(
+          `Part ${i + 1}: "${ansArray[i] || "blank"}" incorrect. Expected: ${acceptedList.join(" or ")}`
+        );
+      }
+    }
+    const awarded = Math.round((correct / subQs.length) * maxMarks);
+    return {
+      m: Math.min(maxMarks, awarded),
+      feedback: feedbackNotes.length === 0 ? "All inspection questions correct." : feedbackNotes.join("; "),
+    };
+  }
+
+  // 3. Sorting pass-by-pass
+  if (task.type === "sort") {
+    const studentRows = Array.isArray(studentAns) ? studentAns : [];
+    const expectedRows = (task.rows || []) as string[][];
+    let earned = 0;
+    let totalBoxes = 0;
+    const errorsList: string[] = [];
+
+    for (let rIdx = 0; rIdx < expectedRows.length; rIdx++) {
+      const row = expectedRows[rIdx];
+      for (let cIdx = 0; cIdx < row.length; cIdx++) {
+        totalBoxes++;
+        const expectedCell = row[cIdx];
+        const studentCell = (studentRows[rIdx] || [])[cIdx] || "";
+        const ok = normalizeStringAnswer(studentCell) === normalizeStringAnswer(expectedCell);
+        if (ok) {
+          earned++;
+        } else if (errorsList.length < 2) {
+          errorsList.push(
+            `Pass ${rIdx + 1}, Pos ${cIdx + 1}: entered "${studentCell}" vs expected "${expectedCell}"`
+          );
+        }
+      }
+    }
+    if (totalBoxes === 0) return { m: 0 };
+    const awarded = Math.round((earned / totalBoxes) * maxMarks);
+    return {
+      m: Math.min(maxMarks, awarded),
+      feedback:
+        earned === totalBoxes
+          ? "Sorting trace completely correct."
+          : `Sorting trace: ${earned}/${totalBoxes} passes correct.`,
+    };
+  }
+
+  if (task.type === "table") {
+    const rawRows = task.rows || task.tableRows || [];
+    let fillableCount = 0;
+    let correctCount = 0;
+    const givenGrid = Array.isArray(studentAns) ? studentAns : [];
+
+    for (let r = 0; r < rawRows.length; r++) {
+      const rawRow = rawRows[r];
+      const cells = Array.isArray(rawRow) ? rawRow : Array.isArray(rawRow?.c) ? rawRow.c : [];
+      for (let c = 0; c < cells.length; c++) {
+        const cell = cells[c];
+        if (cell && !cell.g) {
+          fillableCount++;
+          const givenVal =
+            givenGrid[r] && givenGrid[r][c] !== undefined && givenGrid[r][c] !== null
+              ? String(givenGrid[r][c]).trim()
+              : "";
+          const expectedBlank = String(cell.v ?? "").trim() === "";
+          // Trace tables often require some cells to stay empty
+          if (expectedBlank ? givenVal === "" : givenVal && cellMatches(givenVal, cell.v)) {
+            correctCount++;
+          }
+        }
+      }
+    }
+
+    if (fillableCount === 0) return { m: 0, feedback: "Table has no fillable cells." };
+
+    // Check if candidate actually entered any values
+    const hasEnteredValues = givenGrid.some((row: any) =>
+      Array.isArray(row) && row.some((val: any) => val !== undefined && val !== null && String(val).trim() !== "")
+    );
+    if (!hasEnteredValues) {
+      return { m: 0, feedback: "No values entered in trace table." };
+    }
+
+    let awarded = Math.min(maxMarks, Math.round((correctCount / fillableCount) * maxMarks));
+    let feedback = `Table score: ${correctCount} of ${fillableCount} cells correct (${awarded}/${maxMarks} marks).`;
+
+    // Past-paper trace tables are marked by column/row rules in the mark scheme,
+    // which strict cell matching can't see. Let the AI examiner apply those rules.
+    if (awarded < maxMarks && hasMarkSchemeInfo(task) && getGeminiClient()) {
+      const expectedGrid = rawRows.map((row: any) =>
+        (Array.isArray(row) ? row : row?.c || []).map((cell: any) => (cell ? String(cell.v ?? "") : ""))
+      );
+      const header = (task.columns || []).map((c: any) => c.label || "").join(" | ");
+      const render = (grid: any[]) =>
+        grid.map((row: any) => (Array.isArray(row) ? row.map((v: any) => String(v ?? "")).join(" | ") : "")).join("\n");
+      const ms = collectMarkScheme(task);
+      const r = await markWrittenAnswer({
+        question: describeQuestion(task) + "\n\nCompleted table expected:\n" + header + "\n" + render(expectedGrid),
+        studentAnswer: "Candidate's table:\n" + header + "\n" + render(givenGrid),
+        markScheme: ms.text,
+        markPoints: ms.markPoints.length ? ms.markPoints : undefined,
+        maxMarks,
+      });
+      const aiMarks = Math.max(0, Math.min(maxMarks, Math.round(r.awardedMarks)));
+      if (aiMarks > awarded) {
+        awarded = aiMarks;
+        feedback = `${feedback} Marked against the mark scheme: ${r.feedback}`;
+      }
+    }
+
+    return { m: awarded, feedback };
+  }
+
+  if (task.type === "code") {
+    const code = typeof studentAns === "string" ? studentAns : "";
+    if (!code.trim()) return { m: 0, feedback: "No code submitted." };
+
+    const tests = task.tests || [];
+
+    // Anti-Hardcoding Guard: detects static prints without inputs or hardcoded lookup tables
+    if (tests.length) {
+      const hardcodeCheck = detectAntiHardcoding(code, tests);
+      if (hardcodeCheck.isHardcoded) {
+        return {
+          m: 0,
+          feedback: `Anti-Hardcoding Guard triggered: ${hardcodeCheck.reason || "Hardcoded outputs are not permitted. Solutions must calculate values dynamically from inputs."}`,
+        };
+      }
+    }
+
+    // No automated tests: mark against the mark scheme with AI instead of guessing.
+    if (!tests.length) {
+      const aiResult = hasMarkSchemeInfo(task) ? await markCodeWithAI(task, code, maxMarks) : null;
+      if (aiResult) return aiResult;
+      return {
+        m: 0,
+        feedback: "This question has no automated tests or mark scheme, so it needs to be marked by the teacher.",
+      };
+    }
+
+    const results = await runPythonTests(code, tests.map((t: any) => t.in || []), getFilesForTask(task));
+    if (!results) {
+      // Python could not be run on this server: use AI marking against the mark scheme and tests.
+      const aiResult = await markCodeWithAI(task, code, maxMarks);
+      if (aiResult) return aiResult;
+      return {
+        m: 0,
+        feedback: "Python could not be run on the server and AI marking is unavailable. Please mark this answer manually.",
+      };
+    }
+
+    let earnedMarks = 0;
+    let passedTests = 0;
+    const testWeight = maxMarks / tests.length;
+    const testDetails: CodeTestDetail[] = [];
+
+    tests.forEach((test: any, i: number) => {
+      const res = results[i];
+      const worth = typeof test.m === "number" ? test.m : testWeight;
+      let passed = false;
+      if (res && !res.err) {
+        const comp = flexibleCompareOutputs(res.out, test.out || "");
+        if (comp.matches) {
+          passed = true;
+          passedTests++;
+          earnedMarks += worth;
+        }
+      }
+      // Last line of a Python error is the useful bit (e.g. "IndexError: list index out of range")
+      const errLine = res?.err ? String(res.err).trim().split("\n").filter(Boolean).pop() : undefined;
+      testDetails.push({
+        inputs: (test.in || []).map(String),
+        output: String(res?.out ?? "").slice(0, 2000),
+        expected: String(test.out ?? ""),
+        passed,
+        marks: passed ? Math.round(worth * 10) / 10 : 0,
+        maxMarks: Math.round(worth * 10) / 10,
+        error: errLine ? errLine.slice(0, 300) : undefined,
+      });
+    });
+
+    let awarded = Math.max(0, Math.min(maxMarks, Math.round(earnedMarks)));
+    let feedback = `Passed ${passedTests} of ${tests.length} automated test cases (Anti-Hardcoding Shield active).`;
+    let points: MarkPoint[] | undefined;
+
+    // Tests are strict about exact output. If not everything passed and a mark scheme
+    // exists, let the AI examiner award method marks the tests could not see, and say
+    // point by point where marks were gained and lost.
+    if (passedTests < tests.length && hasMarkSchemeInfo(task)) {
+      const ranText = testDetails
+        .slice(0, 6)
+        .map(
+          (t, i) =>
+            `Test ${i + 1}: inputs ${JSON.stringify(t.inputs)} | expected ${JSON.stringify(t.expected.slice(0, 300))} | printed ${JSON.stringify(
+              t.output.slice(0, 300)
+            )}${t.error ? " | error " + t.error : ""} | ${t.passed ? "PASS" : "FAIL"}`
+        )
+        .join("\n");
+      const aiResult = await markCodeWithAI(task, code, maxMarks, ranText);
+      if (aiResult) {
+        if (aiResult.points && aiResult.points.length) points = aiResult.points;
+        if (aiResult.m > awarded) awarded = aiResult.m;
+        if (aiResult.feedback) feedback = `${feedback} ${aiResult.feedback}`;
+      }
+    }
+
+    return { m: awarded, feedback, tests: testDetails, ...(points ? { points } : {}) };
+  }
+
+  if (task.type === "theory") {
+    const subQs = task.theorySubQuestions || [];
+    if (subQs.length > 0) {
+      let totalEarned = 0;
+      const notes: string[] = [];
+      const subPoints: MarkPoint[] = [];
+      const ansMap = typeof studentAns === "object" && studentAns !== null ? studentAns : {};
+      for (const tsq of subQs) {
+        const given = String(ansMap[tsq.id] || "");
+        const subMax = tsq.marks || 1;
+        const subScheme =
+          tsq.markScheme ||
+          (Array.isArray(tsq.criteria) ? tsq.criteria.join("; ") : "") ||
+          (Array.isArray(tsq.keywords) ? "Key terms: " + tsq.keywords.join(", ") : "");
+        const r = await markWrittenAnswer({
+          question: tsq.q || tsq.question || task.brief || "",
+          studentAnswer: given,
+          markScheme: subScheme,
+          markPoints: Array.isArray(tsq.markPoints) ? tsq.markPoints : undefined,
+          maxMarks: subMax,
+        });
+        totalEarned += Math.max(0, Math.min(subMax, Math.round(r.awardedMarks)));
+        if (r.feedback) notes.push(r.feedback);
+        subPoints.push(...normalizeMarkPoints(r.breakdown));
+      }
+      return { m: Math.min(maxMarks, totalEarned), feedback: notes.join(" "), points: subPoints };
+    }
+
+    const ms = collectMarkScheme(task);
+    const r = await markWrittenAnswer({
+      question: describeQuestion(task),
+      studentAnswer: answerToText(studentAns),
+      markScheme: ms.text || task.hint || "",
+      markPoints: ms.markPoints.length ? ms.markPoints : undefined,
+      maxMarks,
+    });
+    return {
+      m: Math.max(0, Math.min(maxMarks, Math.round(r.awardedMarks))),
+      feedback: task.manualReview
+        ? `${r.feedback} (Originally a drawing question - please check this mark.)`
+        : r.feedback,
+      points: normalizeMarkPoints(r.breakdown),
+    };
+  }
+
+  // Any other question type: mark against the mark scheme when one exists.
+  const answerText = answerToText(studentAns);
+  if (!answerText.trim()) return { m: 0, feedback: "No answer provided." };
+  if (hasMarkSchemeInfo(task)) {
+    const ms = collectMarkScheme(task);
+    const r = await markWrittenAnswer({
+      question: describeQuestion(task),
+      studentAnswer: answerText,
+      markScheme: ms.text || (task.solution ? "Model answer:\n" + task.solution : ""),
+      markPoints: ms.markPoints.length ? ms.markPoints : undefined,
+      maxMarks,
+    });
+    return { m: Math.max(0, Math.min(maxMarks, Math.round(r.awardedMarks))), feedback: r.feedback, points: normalizeMarkPoints(r.breakdown) };
+  }
+  return { m: 0, feedback: "No mark scheme available for this question; please mark it manually." };
+}
+
+// Assessment management endpoints (Public list for active assessments, full details for authenticated teachers)
+app.get("/api/assessments", (req, res) => {
+  const isTeacher = isTeacherRequest(req);
+  // Students never get the list of assessments: they can only open one with the
+  // code / link / QR code their teacher shares (see /api/assessments/:code/join).
+  if (!isTeacher) {
+    res.json({ assessments: [] });
+    return;
+  }
+  const list = Object.values(assessmentsDb)
+    .filter((a) => isTeacher || a.status === "active")
+    .map((a) => ({
+      id: a.id,
+      title: a.title,
+      ibLevel: a.ibLevel,
+      code: a.code,
+      type: a.type || "assessment",
+      customHeaderBanner: a.customHeaderBanner,
+      customSubtitle: a.customSubtitle,
+      customInstructions: a.customInstructions,
+      durationMinutes: a.durationMinutes,
+      showScoreImmediately: a.showScoreImmediately,
+      allowCopyPaste: a.allowCopyPaste,
+      showOperatorToolbar: a.showOperatorToolbar,
+      shareSolutions: a.shareSolutions,
+      instantFeedback: Boolean(a.instantFeedback),
+      feedbackDetail: a.feedbackDetail || "tests",
+      maxChecks: a.maxChecks ?? 3,
+      classGroup: a.classGroup || undefined,
+      questionIds: a.questionIds || [],
+      questions: isTeacher ? (a.questions || []) : undefined,
+      questionCount: (a.questionIds || []).length,
+      maxMarks: a.maxMarks,
+      gradeBoundaries: a.gradeBoundaries,
+      createdAt: a.createdAt,
+      status: a.status,
+      // Assessments made before teacher accounts existed belong to the original account
+      ownerId: isTeacher ? (a as any).ownerId || "t_primary" : undefined,
+      ownerName: isTeacher ? (a as any).ownerName || teachersDb[(a as any).ownerId || "t_primary"]?.name : undefined,
+      studentsCount: isTeacher ? Object.keys(a.students || {}).length : undefined,
+      submittedCount: isTeacher ? Object.values(a.students || {}).filter((s) => s.status === "submitted").length : undefined,
+    }));
+  res.json({ assessments: list });
+});
+
+// System settings for Practice Mode: Get practice settings (Public for all students)
+app.get("/api/settings/practice", (req, res) => {
+  res.json({
+    allowCopyPaste: systemSettings.allowPracticeCopyPaste,
+    practiceOpen: systemSettings.practiceOpen !== false,
+    hiddenQuestionIds: questionIdsInLiveAssessments(),
+  });
+});
+
+// System settings for Practice Mode: Update practice settings (Protected by Teacher Auth)
+app.post("/api/settings/practice", requireTeacher, (req, res) => {
+  const { allowCopyPaste, practiceOpen } = req.body;
+  if (allowCopyPaste !== undefined) {
+    systemSettings.allowPracticeCopyPaste = Boolean(allowCopyPaste);
+  }
+  if (practiceOpen !== undefined) {
+    systemSettings.practiceOpen = Boolean(practiceOpen);
+  }
+  savePersistedSettings();
+  res.json({
+    success: true,
+    allowCopyPaste: systemSettings.allowPracticeCopyPaste,
+    practiceOpen: systemSettings.practiceOpen !== false,
+  });
+});
+
+// Custom questions endpoint: get all questions created or edited by teacher
+app.get("/api/custom-questions", (req, res) => {
+  // Teachers get everything. Students never get questions from open assessments (with
+  // their mark schemes), and nothing at all while the Practice portal is closed.
+  if (isTeacherRequest(req)) {
+    res.json({ questions: Object.values(customQuestionsDb), deletedIds: systemSettings.deletedQuestionIds || [] });
+    return;
+  }
+  if (systemSettings.practiceOpen === false) {
+    res.json({ questions: [] });
+    return;
+  }
+  const hidden = new Set(questionIdsInLiveAssessments());
+  res.json({ questions: Object.values(customQuestionsDb).filter((q: any) => q && !hidden.has(q.id)) });
+});
+
+// Save or update a custom question (Protected)
+app.post("/api/custom-questions", requireTeacher, (req, res) => {
+  const task = req.body && typeof req.body === "object" && req.body.id ? ensureIBUnit(req.body) : req.body;
+  if (!task || !task.id) {
+    res.status(400).json({ error: "Invalid task data: id required" });
+    return;
+  }
+  const teacher = (req as any).teacher as TeacherProfile | undefined;
+  if (teacher) {
+    if (!task.authorId) task.authorId = teacher.id;
+    if (!task.authorName) task.authorName = teacher.name;
+    if (!task.authorSchool) task.authorSchool = teacher.school;
+  }
+  customQuestionsDb[task.id] = task;
+  savePersistedQuestions();
+  forgetDeletedQuestions([task.id]);
+
+  // Also update this question in any assessment that contains it
+  let assessmentsChanged = false;
+  for (const a of Object.values(assessmentsDb)) {
+    if (a.questionIds && a.questionIds.includes(task.id)) {
+      if (a.questions && Array.isArray(a.questions)) {
+        a.questions = a.questions.map((q: any) => (q && q.id === task.id ? task : q));
+        if (!a.questions.some((q: any) => q && q.id === task.id)) {
+          a.questions.push(task);
+        }
+      } else {
+        a.questions = [task];
+      }
+      assessmentsChanged = true;
+    }
+  }
+  if (assessmentsChanged) {
+    savePersistedAssessments();
+  }
+
+  res.json({ success: true, task });
+});
+
+// Helper for generating rule-based pedagogical scaffolding when offline or Gemini is constrained
+function generateRuleBasedScaffold(
+  task: any,
+  studentAnswer: any,
+  consoleOutput: string = "",
+  failedTests: any = null,
+  struggleReason: string = "general"
+) {
+  const brief = String(task.brief || "").toLowerCase();
+  const title = String(task.title || "");
+  const codeStr = typeof studentAnswer === "string" ? studentAnswer : "";
+  const starter = String(task.starter || "");
+  const isCode = task.type === "code";
+
+  // Derive Concept
+  let concept = "Algorithm Design & Problem Solving";
+  if (brief.includes("input") && (brief.includes("int") || brief.includes("number") || brief.includes("mark") || brief.includes("age"))) {
+    concept = "User Input & Type Conversion";
+  } else if (brief.includes("if") || brief.includes("condition") || brief.includes("selection") || brief.includes("otherwise") || brief.includes("grade")) {
+    concept = "Conditional Selection (if / elif / else)";
+  } else if (brief.includes("loop") || brief.includes("for") || brief.includes("while") || brief.includes("repeat") || brief.includes("count")) {
+    concept = "Iteration & Controlled Loops";
+  } else if (brief.includes("list") || brief.includes("array") || brief.includes("names") || brief.includes("items")) {
+    concept = "List Structures & Element Indexing";
+  } else if (brief.includes("string") || brief.includes("substring") || brief.includes("upper") || brief.includes("lower") || brief.includes("split")) {
+    concept = "String Slicing & String Methods";
+  } else if (brief.includes("file") || brief.includes("read") || brief.includes("write") || brief.includes(".txt")) {
+    concept = "Text File Handling (open / read / write / close)";
+  } else if (brief.includes("def ") || brief.includes("function") || brief.includes("subroutine") || brief.includes("return")) {
+    concept = "Subroutines, Parameters & Return Values";
+  } else if (task.type === "table") {
+    concept = "Dry-Run Trace Table Analysis";
+  }
+
+  // Determine Level 1 Clue
+  let level1Clue = task.hint || "Carefully re-read what data must be taken in (Inputs), what calculation or check is done (Process), and what text must be displayed (Output).";
+  if (!codeStr || codeStr.trim() === starter.trim()) {
+    level1Clue = `To begin this task on ${concept}, look at what input is requested first. Set up your variable to store the value, convert its type if a number is needed, and then write your processing step.`;
+  } else if (consoleOutput.includes("TypeError")) {
+    level1Clue = "Notice how Python handles data types. When input() is called, it returns text (a string). To perform comparisons (like > or <) or math, you must wrap it with int() or float().";
+  } else if (consoleOutput.includes("SyntaxError")) {
+    level1Clue = "Look closely at the syntax of your statements. In Python, compound statements (like if, for, while, def) MUST end with a colon (:), and all opened quotes or brackets must be closed.";
+  }
+
+  // Determine Level 2 Steps
+  const level2LogicSteps = [
+    "Step 1: Read the required input from the user using input() and store it in a meaningfully named variable.",
+    "Step 2: If the input represents numeric data, cast it using int(variable) or float(variable) before using it.",
+    "Step 3: Implement the core logic using an if/elif/else branch, loop, or string operation to satisfy the condition in the question brief.",
+    "Step 4: Use print() to display the exact output format requested by the examiner, with correct spacing and punctuation.",
+  ];
+
+  // Determine Level 3 Structure
+  let level3Structure = `# Step 1: Input & Type Conversion
+user_input = input("Enter value: ")
+# user_val = int(user_input)  # Uncomment if number needed
+
+# Step 2: Core Logic / Decision
+# TODO: Write your condition or loop:
+# if condition:
+#     # do action
+# else:
+#     # do other action
+
+# Step 3: Output
+# TODO: print the final result
+# print(result)
+`;
+
+  if (concept.includes("Iteration")) {
+    level3Structure = `# Step 1: Initialize counters / inputs
+# total = 0
+
+# Step 2: Loop through range or list
+# for item in items:
+#     # TODO: Process each item
+#     pass
+
+# Step 3: Print result
+# print(total)
+`;
+  } else if (concept.includes("Selection")) {
+    level3Structure = `# Step 1: Take input
+# val = int(input("Enter number: "))
+
+# Step 2: Compare with condition
+# if val >= 50:
+#     print("Pass")
+# else:
+#     print("Fail")
+`;
+  }
+
+  // Determine What Went Wrong
+  let whatWentWrong = "No fatal syntax errors found. Check whether your program output matches all test cases and formatting requirements.";
+  let immediateNextStep = "Run your program with sample test inputs and verify the printed text matches the expected question brief.";
+
+  if (consoleOutput.includes("SyntaxError")) {
+    whatWentWrong = "SyntaxError detected: Check the line indicated by the arrow. Common causes include a missing colon (:) at the end of an if/for/while line, or an unclosed quotation mark/parenthesis.";
+    immediateNextStep = "Add a colon (:) to the end of your if/for line or close any open brackets () and quotes.";
+  } else if (consoleOutput.includes("IndentationError")) {
+    whatWentWrong = "IndentationError: Python uses indentation (4 spaces) to define code blocks. A line inside an 'if', 'for', 'while', or 'def' block is not indented correctly.";
+    immediateNextStep = "Select the lines inside your if or loop block and indent them by 4 spaces.";
+  } else if (consoleOutput.includes("TypeError")) {
+    whatWentWrong = "TypeError: You are likely comparing a string with a number (e.g. string > int). Remember that input() always returns text in Python 3.";
+    immediateNextStep = "Convert your input variable using int(variable) before doing arithmetic or comparisons.";
+  } else if (consoleOutput.includes("IndexError")) {
+    whatWentWrong = "IndexError: You tried to access a list element or character at an index that doesn't exist. Python indexes start at 0, and the last item is at len(items) - 1.";
+    immediateNextStep = "Check your index variable or loop bounds (e.g., range(len(items))) to ensure you don't go past the end.";
+  } else if (consoleOutput.includes("NameError")) {
+    whatWentWrong = "NameError: A variable name was used that has not been defined yet, or there is a spelling / capitalization typo.";
+    immediateNextStep = "Check the spelling of the variable name in your code to ensure it matches where you created it.";
+  } else if (failedTests && Array.isArray(failedTests) && failedTests.length > 0) {
+    const ft = failedTests[0];
+    whatWentWrong = `Test case ${ft.testIndex || 1} failed. Expected output was: "${ft.expected}", but your program produced: "${ft.actual || "(no output)"}". Check for extra labels or incorrect calculation.`;
+    immediateNextStep = "Adjust your print() statement so the printed string matches the expected output character-for-character.";
+  } else if (!codeStr || codeStr.trim() === starter.trim()) {
+    whatWentWrong = "Your program is currently empty or contains only starter comments. You haven't added the logic steps yet.";
+    immediateNextStep = "Write the first input() statement to store user data in a variable.";
+  }
+
+  const howToImprove = "1. Use meaningful variable names (e.g. 'total_score' instead of 'x') to secure clarity marks.\n2. Ensure proper type casting (e.g. int() or float()) on all numeric inputs.\n3. Make sure print statements do not include extra unwanted spaces or prompts if the question asks for exact output.";
+
+  return {
+    concept,
+    level1Clue,
+    level2LogicSteps,
+    level3Structure,
+    whatWentWrong,
+    howToImprove,
+    immediateNextStep,
+  };
+}
+
+// AI Practice Scaffolding & Live Tutor Endpoint for Practice Tasks
+app.post("/api/ai/practice-scaffold", async (req, res) => {
+  try {
+    const {
+      task,
+      studentAnswer,
+      consoleOutput = "",
+      failedTests = null,
+      scaffoldLevel = 1,
+      struggleReason = "general",
+    } = req.body;
+
+    if (!task) {
+      res.status(400).json({ error: "Task object is required" });
+      return;
+    }
+
+    const ai = getGeminiClient();
+    if (ai) {
+      try {
+        const prompt = `You are an expert, supportive Computer Science teacher and pedagogical tutor specializing in IB Diploma Programme Computer Science (first assessment 2027), especially Paper 2 (theme B: Computational thinking and problem-solving, Python 3) and the IB command terms.
+
+A student is doing practice questions set by their teacher. The student is struggling or stuck on a step and needs guidance.
+
+TASK SPECIFICATION:
+Title: ${task.title || "Programming Task"}
+IB topic: ${task.unit || "B2"} (${task.unitName || "Programming"})${task.specReference ? ` - syllabus ${task.specReference}` : ""}${task.ibLevel ? ` - ${task.ibLevel}` : ""}${task.commandWord ? `\nCommand term: ${task.commandWord}` : ""}
+Type: ${task.type || "code"}
+Marks: ${task.marks || 2}
+Question Brief:
+${task.brief || "(No brief provided)"}
+
+Starter Code:
+${task.starter || "(None)"}
+
+Reference Tests / Criteria:
+${task.tests ? JSON.stringify(task.tests.slice(0, 3)) : "(None)"}
+
+STUDENT CURRENT ATTEMPT:
+Current Student Code / Answer:
+${studentAnswer ? (typeof studentAnswer === "string" ? studentAnswer : JSON.stringify(studentAnswer)) : "(Empty / Not started)"}
+
+Execution Console Output / Runtime Error (if any):
+${consoleOutput || "(No console output)"}
+
+Failed Tests / Marker Diagnostics (if any):
+${failedTests ? (typeof failedTests === "string" ? failedTests : JSON.stringify(failedTests)) : "(None)"}
+
+Struggle Reason indicated:
+${struggleReason}
+
+Requested Scaffolding Level: ${scaffoldLevel} (1 = Concept & Nudge, 2 = Numbered Logic Breakdown, 3 = Structural Code Skeleton)
+
+PEDAGOGICAL REQUIREMENTS:
+0. Stay inside the IB DP Computer Science syllabus for the question's level (SL students have not met recursion, multiple-class OOP or B4 abstract data types). If the brief prohibits a built-in function (e.g. sort, max, min), never suggest it.
+1. SCAFFOLDING PRINCIPLE: Do NOT simply write the full finished solution for them. Guide the student so they think through each step and write the code themselves.
+2. LEVEL 1 (Concept & Nudge): Explain what the question actually asks for in plain, friendly English. Highlight the key computational thinking concept without giving away code.
+3. LEVEL 2 (Numbered Logic Breakdown): Break down the algorithm into 3 to 5 clear sequential steps (e.g., "1. Take input and convert to integer. 2. Compare mark..."). State which step their code is currently at.
+4. LEVEL 3 (Code Structure Skeleton): Provide a structural code snippet with clear placeholders (# TODO: ...) showing syntax patterns without giving away the final solution.
+5. WHAT WENT WRONG: Directly analyze their current code vs the brief and any runtime errors or failed tests. Pinpoint the exact line number, type mismatch, off-by-one, indentation, unclosed parenthesis, or missing condition.
+6. HOW TO IMPROVE: Give 2-3 concrete tips on how their program can be improved (e.g., meaningful variable names, formatting output, handling unexpected input, removing redundant code).
+7. IMMEDIATE NEXT STEP: Exactly ONE simple, concrete micro-action for the student to do right now to move forward.
+
+Respond ONLY with valid JSON matching this schema:
+{
+  "concept": "Name of the core programming concept (e.g., 'Type Conversion with int() & Selection')",
+  "level1Clue": "Encouraging, clear conceptual hint explaining the task requirement without spoiling code.",
+  "level2LogicSteps": [
+    "Step 1: ...",
+    "Step 2: ...",
+    "Step 3: ..."
+  ],
+  "level3Structure": "Code skeleton or syntax pattern with comments showing the structure.",
+  "whatWentWrong": "Specific, clear analysis of the bug, syntax issue, logic flaw, or why the test failed.",
+  "howToImprove": "Practical tips on making the program cleaner, more robust, or closer to what the IB markscheme rewards.",
+  "immediateNextStep": "A single actionable sentence guiding the student's next keystrokes."
+}`;
+
+        const aiResponse = await generateContentWithResilience(ai, {
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        const text = aiResponse.text || "{}";
+        const parsed = JSON.parse(text);
+        res.json({ success: true, scaffold: parsed, source: "gemini" });
+        return;
+      } catch (geminiErr: any) {
+        console.info("Gemini practice scaffold fallback invoked:", geminiErr?.message || geminiErr);
+      }
+    }
+
+    // Heuristic Fallback engine
+    const fallbackScaffold = generateRuleBasedScaffold(task, studentAnswer, consoleOutput, failedTests, struggleReason);
+    res.json({ success: true, scaffold: fallbackScaffold, source: "rule-based" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to generate AI scaffolding" });
+  }
+});
+
+
+// Make a personal copy of an assessment or practice task (same questions and settings,
+// new join code, no students) so each teacher can run it for their own class.
+app.post("/api/assessments/:id/duplicate", requireTeacher, (req, res) => {
+  const me = getTeacherFromRequest(req);
+  const source =
+    assessmentsDb[req.params.id] ||
+    Object.values(assessmentsDb).find((a) => a.code === String(req.params.id).toUpperCase());
+  if (!source) {
+    res.status(404).json({ error: "That assessment could not be found on the server, so it can't be copied." });
+    return;
+  }
+
+  const usedCodes = new Set(Object.values(assessmentsDb).map((a) => a.code));
+  let code = "";
+  do {
+    code = Math.random().toString(36).substring(2, 8).toUpperCase();
+  } while (code.length < 6 || usedCodes.has(code));
+  const id = "a_" + Math.random().toString(36).substring(2, 8) + Date.now().toString(36).slice(-3);
+
+  // Deep copy so later edits to either version don't affect the other
+  const { students: _students, ...settings } = JSON.parse(JSON.stringify(source));
+  const requestedTitle = String(req.body?.title || "").trim();
+  const copy: AssessmentStore = {
+    ...settings,
+    id,
+    code,
+    title: requestedTitle || `${source.title} (${me?.name || "copy"})`,
+    ownerId: me?.id,
+    ownerName: me?.name,
+    createdAt: Date.now(),
+    status: "active",
+    students: {},
+  };
+  assessmentsDb[id] = copy;
+  savePersistedAssessments();
+  res.json({ success: true, assessment: copy });
+});
+
+app.post("/api/assessments", requireTeacher, (req, res) => {
+  const creator = getTeacherFromRequest(req);
+  const { title, durationMinutes, showScoreImmediately, allowCopyPaste, showOperatorToolbar, shareSolutions, instantFeedback, customHeaderBanner, customSubtitle, customInstructions, headerConfig, questionIds, questions, maxMarks, type, gradeBoundaries } = req.body;
+  const id = "a_" + Math.random().toString(36).substring(2, 8);
+  const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+
+  const isTask = type === "task";
+  const newAssessment: AssessmentStore = {
+    id,
+    title: title || (isTask ? "IB CS Practice Task" : "IB CS Assessment"),
+    code,
+    type: isTask ? "task" : "assessment",
+    customHeaderBanner: customHeaderBanner || undefined,
+    customSubtitle: customSubtitle || undefined,
+    customInstructions: customInstructions || undefined,
+    headerConfig: headerConfig || {
+      schoolOrDepartment: "Department of Computer Science",
+      subjectSubtitle: isTask ? "IB DP Computer Science - Practice Task" : "IB DP Computer Science - In-Class Assessment",
+      termOrClass: "Class Assessment",
+      instructionsNotice: "Answer all questions. You may run your code in the embedded editor.",
+      headerTheme: isTask ? "emerald-lab" : "purple-exam",
+    },
+    durationMinutes: Number(durationMinutes) || 0,
+    showScoreImmediately: showScoreImmediately !== false,
+    allowCopyPaste: allowCopyPaste !== undefined ? Boolean(allowCopyPaste) : isTask,
+    showOperatorToolbar: showOperatorToolbar !== undefined ? Boolean(showOperatorToolbar) : isTask,
+    shareSolutions: shareSolutions !== undefined ? Boolean(shareSolutions) : isTask,
+    instantFeedback: Boolean(instantFeedback),
+    feedbackDetail: cleanFeedbackDetail(req.body?.feedbackDetail),
+    classGroup: cleanClassGroup(req.body?.classGroup),
+    maxChecks: cleanMaxChecks(req.body?.maxChecks),
+    ibLevel: req.body?.ibLevel === "HL" ? "HL" : "SL",
+    questionIds: questionIds || [],
+    questions: Array.isArray(questions) ? questions : undefined,
+    maxMarks: Number(maxMarks) || 20,
+    gradeBoundaries: gradeBoundaries || undefined,
+    createdAt: Date.now(),
+    ownerId: creator?.id,
+    ownerName: creator?.name,
+    status: "active",
+    students: {},
+  };
+
+  assessmentsDb[id] = newAssessment;
+  savePersistedAssessments();
+  res.json({ success: true, assessment: newAssessment });
+});
+
+// Update an existing assessment (Protected)
+app.put("/api/assessments/:id", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const { title, type, durationMinutes, showScoreImmediately, allowCopyPaste, showOperatorToolbar, shareSolutions, customHeaderBanner, customSubtitle, customInstructions, headerConfig, questionIds, questions, maxMarks, status, gradeBoundaries } = req.body;
+
+  if (title !== undefined) a.title = String(title).trim() || a.title;
+  if (type !== undefined) a.type = type === "task" ? "task" : "assessment";
+  if (customHeaderBanner !== undefined) a.customHeaderBanner = customHeaderBanner;
+  if (customSubtitle !== undefined) a.customSubtitle = customSubtitle;
+  if (customInstructions !== undefined) a.customInstructions = customInstructions;
+  if (headerConfig !== undefined) a.headerConfig = headerConfig;
+  if (durationMinutes !== undefined) a.durationMinutes = Math.max(0, Number(durationMinutes) || 0);
+  if (showScoreImmediately !== undefined) a.showScoreImmediately = Boolean(showScoreImmediately);
+  if (allowCopyPaste !== undefined) a.allowCopyPaste = Boolean(allowCopyPaste);
+  if (showOperatorToolbar !== undefined) a.showOperatorToolbar = Boolean(showOperatorToolbar);
+  if (shareSolutions !== undefined) a.shareSolutions = Boolean(shareSolutions);
+  if (req.body?.instantFeedback !== undefined) a.instantFeedback = Boolean(req.body.instantFeedback);
+  if (req.body?.feedbackDetail !== undefined) a.feedbackDetail = cleanFeedbackDetail(req.body.feedbackDetail);
+  if (req.body?.classGroup !== undefined) a.classGroup = cleanClassGroup(req.body.classGroup);
+  if (req.body?.maxChecks !== undefined) a.maxChecks = cleanMaxChecks(req.body.maxChecks);
+  if (req.body?.ibLevel !== undefined) a.ibLevel = req.body.ibLevel === "HL" ? "HL" : "SL";
+  if (Array.isArray(questionIds)) {
+    // Keep the full definition of any question taken out, so answers to it can still be shown and marked
+    const before = enrichAssessment(a).questions || [];
+    const keep = new Set(questionIds.map(String));
+    const retired: Record<string, any> = { ...((a as any).retiredQuestions || {}) };
+    for (const q of before) if (q && q.id && !keep.has(q.id)) retired[q.id] = q;
+    for (const id of keep) delete retired[id];
+    (a as any).retiredQuestions = retired;
+    a.questionIds = questionIds;
+  }
+  if (Array.isArray(questions)) a.questions = questions;
+  if (maxMarks !== undefined) a.maxMarks = Math.max(1, Number(maxMarks) || 1);
+  if (status !== undefined) a.status = status;
+  if (gradeBoundaries !== undefined) a.gradeBoundaries = gradeBoundaries;
+
+  if (a.students) {
+    for (const sid of Object.keys(a.students)) {
+      a.students[sid].maxMarks = a.maxMarks;
+      if (a.students[sid].totalMarks !== undefined && a.maxMarks > 0) {
+        a.students[sid].percentage = Math.round((a.students[sid].totalMarks / a.maxMarks) * 100);
+      }
+    }
+  }
+
+  savePersistedAssessments();
+  res.json({ success: true, assessment: a });
+});
+
+// Update grade boundaries for an assessment (Protected)
+app.post("/api/assessments/:id/grade-boundaries", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const { gradeBoundaries } = req.body;
+  if (!gradeBoundaries || typeof gradeBoundaries !== "object") {
+    res.status(400).json({ error: "Invalid grade boundaries payload" });
+    return;
+  }
+
+  a.gradeBoundaries = gradeBoundaries;
+  savePersistedAssessments();
+  res.json({ success: true, assessment: a, gradeBoundaries: a.gradeBoundaries });
+});
+
+// Delete an assessment (Protected)
+app.delete("/api/assessments/:id", requireTeacher, (req, res) => {
+  const targetId = req.params.id;
+  let idToDelete = targetId;
+
+  if (!assessmentsDb[idToDelete]) {
+    const found = Object.values(assessmentsDb).find((x) => x.code === targetId.toUpperCase());
+    if (found) idToDelete = found.id;
+  }
+
+  if (!assessmentsDb[idToDelete]) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  delete assessmentsDb[idToDelete];
+  savePersistedAssessments();
+  res.json({ success: true, message: `Assessment ${idToDelete} deleted successfully` });
+});
+
+// Fetch Assessment: Teachers get full solutions; Students get sanitized payload without solutions or other students' data
+app.get("/api/assessments/:id", (req, res) => {
+  const a = assessmentsDb[req.params.id];
+  if (!a) {
+    const byCode = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase());
+    if (byCode) {
+      const enriched = enrichAssessment(byCode);
+      if (isTeacherRequest(req)) {
+        res.json({ assessment: enriched });
+      } else {
+        res.json({ assessment: sanitizeAssessmentForStudent(enriched, String(req.query.sid || "") || undefined) });
+      }
+      return;
+    }
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+  const enriched = enrichAssessment(a);
+  if (isTeacherRequest(req)) {
+    res.json({ assessment: enriched });
+  } else {
+    res.json({ assessment: sanitizeAssessmentForStudent(enriched, String(req.query.sid || "") || undefined) });
+  }
+});
+
+// Student joins via QR Code or PIN (Returns strictly sanitized assessment)
+app.post("/api/assessments/:id/join", (req, res) => {
+  const { name, candidateNumber, className, studentId: requestedStudentId } = req.body;
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const cleanName = (name || "").trim().toLowerCase();
+  
+  // Look for existing session for this specific student in this assessment
+  // 1. By requested studentId ONLY IF it matches the student's name (never hijack another student's session)
+  // 2. Or by normalized student name match
+  let existingSession: LiveStudentSession | undefined;
+  if (requestedStudentId && a.students[requestedStudentId]) {
+    const candidate = a.students[requestedStudentId];
+    const candidateCleanName = (candidate.name || "").trim().toLowerCase();
+    // Only reuse session if the requested name matches the session owner
+    if (!cleanName || candidateCleanName === cleanName) {
+      existingSession = candidate;
+    }
+  }
+
+  // If not matched by ID + name, look for this specific student by clean name in this assessment
+  if (!existingSession && cleanName) {
+    existingSession = Object.values(a.students).find(
+      (s) => (s.name || "").trim().toLowerCase() === cleanName
+    );
+  }
+
+  let session: LiveStudentSession;
+  if (existingSession) {
+    // Reconnect to existing session for this student
+    session = existingSession;
+    session.lastActiveAt = Date.now();
+    if (a.classGroup) session.className = a.classGroup;
+    else if (className && !session.className) session.className = className;
+  } else {
+    // Create new session for this new student
+    const studentId = "s_" + (cleanName || "student").replace(/[^a-z0-9]/g, "") + "_" + Math.random().toString(36).substring(2, 6);
+    session = {
+      studentId,
+      name: (name || "Anonymous Candidate").trim(),
+      candidateNumber: candidateNumber || "C" + Math.floor(1000 + Math.random() * 9000),
+      // The class set by the teacher on the assessment wins over what the student typed
+      className: a.classGroup || String(className || "").trim() || "Not given",
+      status: "in_progress",
+      currentQuestionIndex: 0,
+      answeredQuestions: [],
+      answers: {},
+      marks: {},
+      totalMarks: 0,
+      maxMarks: a.maxMarks,
+      percentage: 0,
+      joinedAt: Date.now(),
+      lastActiveAt: Date.now(),
+    };
+    a.students[session.studentId] = session;
+  }
+
+  savePersistedAssessments();
+
+  const enriched = enrichAssessment(a);
+  res.json({
+    success: true,
+    assessment: sanitizeAssessmentForStudent(enriched, session.studentId),
+    studentSession: studentViewOfSession(a, session),
+  });
+});
+
+// Student updates live progress
+app.post("/api/assessments/:id/progress", (req, res) => {
+  const { studentId, currentQuestionIndex, answeredQuestions, answers } = req.body;
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a || !a.students[studentId]) {
+    res.status(404).json({ error: "Student session not found" });
+    return;
+  }
+
+  const s = a.students[studentId];
+  // A late autosave (e.g. sent just before submitting) must never change a submitted paper
+  if (s.status === "submitted") {
+    res.json({ success: true, ignored: "already submitted" });
+    return;
+  }
+  if (currentQuestionIndex !== undefined) s.currentQuestionIndex = currentQuestionIndex;
+  if (answeredQuestions) s.answeredQuestions = answeredQuestions;
+  if (answers) s.answers = { ...s.answers, ...convertAnswersMap(a, studentId, answers, true) };
+  s.lastActiveAt = Date.now();
+  if (s.status === "joined") s.status = "in_progress";
+
+  savePersistedAssessments();
+  res.json({ success: true });
+});
+
+// "Check answer": marks ONE answer on the server while the student is still working.
+// Only when the teacher switched it on for this assessment. The correct answer is never
+// sent back, only whether it is right and the marks, so students still have to work it out.
+function cleanClassGroup(v: any): string | undefined {
+  const t = String(v ?? "").trim().slice(0, 60);
+  return t || undefined;
+}
+function cleanFeedbackDetail(v: any): "result" | "tests" | "full" {
+  return v === "result" || v === "full" ? v : "tests";
+}
+function cleanMaxChecks(v: any): number {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) && n >= 0 && n <= 50 ? n : 3;
+}
+
+app.post("/api/assessments/:id/check", async (req, res) => {
+  const { studentId, questionId, answer } = req.body || {};
+  let a = assessmentsDb[req.params.id];
+  if (!a) a = Object.values(assessmentsDb).find((x) => x.code === String(req.params.id).toUpperCase()) as AssessmentStore;
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+  if (!a.instantFeedback) {
+    res.status(403).json({ error: "Your teacher has not switched on answer checking for this assessment." });
+    return;
+  }
+  const s = a.students?.[studentId];
+  if (!s) {
+    res.status(404).json({ error: "Student session not found. Please rejoin." });
+    return;
+  }
+  if (s.status === "submitted") {
+    res.status(400).json({ error: "This assessment has already been submitted." });
+    return;
+  }
+  const q = (enrichAssessment(a).questions || []).find((x: any) => x && x.id === questionId);
+  if (!q) {
+    res.status(404).json({ error: "Question not found." });
+    return;
+  }
+  const used = (s.answerChecks && s.answerChecks[questionId]) || 0;
+  const limit = a.maxChecks ?? 3; // 0 = unlimited
+  if (limit > 0 && used >= limit) {
+    res.status(429).json({ error: `You have used all ${limit} checks for this question.`, checksLeft: 0 });
+    return;
+  }
+
+  // Never keep a student waiting: if the AI marker is busy, say so (the check is not used up)
+  const CHECK_TIME_LIMIT_MS = Number(process.env.CHECK_TIME_LIMIT_MS) || 40_000;
+  let timer: any;
+  const result: any = await Promise.race([
+    autoMarkTaskOnServer(q, convertMcqAnswer(q, a.id, studentId, answer, true)),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), CHECK_TIME_LIMIT_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (!result) {
+    res.status(503).json({
+      error: "Checking is taking too long right now (the marker is busy). Your answer is saved and this check was not used up - try again in a minute.",
+    });
+    return;
+  }
+  s.answerChecks = { ...(s.answerChecks || {}), [questionId]: used + 1 };
+  s.lastActiveAt = Date.now();
+  savePersistedAssessments();
+
+  const maxMarks = Number(q.marks) || 1;
+  const marks = Math.max(0, Math.min(maxMarks, Number(result.m) || 0));
+  // Feedback for written/code answers explains what was missing; for multiple choice,
+  // tables and short exact answers it would give the answer away, so it is not sent.
+  const revealsAnswer = ["mcq", "inspect", "table", "sort"].includes(String(q.type));
+  // Programming questions: per-test results, as much as the teacher allows
+  const detail = a.feedbackDetail || "tests";
+  // input("Full name: ") prompts are printed without a new line, so they run into the
+  // program's real output ("Full name: Year: pat20"). Remove the student's own prompts
+  // from what is displayed, so they see just "pat20".
+  const prompts: string[] = [];
+  if (typeof answer === "string") {
+    for (const m of answer.matchAll(/input\(\s*(["'])((?:\\.|(?!\1).)*)\1\s*\)/g)) if (m[2]) prompts.push(m[2]);
+  }
+  const withoutPrompts = (out: string) => {
+    let text = out;
+    for (const pr of prompts) {
+      const i = text.indexOf(pr);
+      if (i >= 0) text = text.slice(0, i) + text.slice(i + pr.length);
+    }
+    return text;
+  };
+  const tests =
+    detail === "result" || !Array.isArray(result.tests)
+      ? undefined
+      : result.tests.map((t: any) => ({
+          inputs: t.inputs,
+          output: withoutPrompts(t.output),
+          passed: t.passed,
+          marks: t.marks,
+          maxMarks: t.maxMarks,
+          error: t.error,
+          ...(detail === "full" ? { expected: t.expected } : {}),
+        }));
+  res.json({
+    success: true,
+    marks,
+    maxMarks,
+    verdict: marks >= maxMarks ? "correct" : marks > 0 ? "partial" : "incorrect",
+    feedback: revealsAnswer ? undefined : studentFriendlyFeedback(String(result.feedback || ""), result.tests, marks, maxMarks),
+    points: revealsAnswer || detail === "result" || !Array.isArray(result.points) || !result.points.length ? undefined : result.points,
+    tests,
+    checksLeft: limit > 0 ? limit - (used + 1) : null,
+  });
+});
+
+/**
+ * Marking notes are written for teachers ("The candidate ...", "Anti-Hardcoding Shield").
+ * For a student checking their answer, say it plainly and to them.
+ */
+function studentFriendlyFeedback(raw: string, tests: any[] | undefined, marks: number, maxMarks: number): string {
+  const parts: string[] = [];
+  if (Array.isArray(tests) && tests.length) {
+    const passed = tests.filter((t) => t && t.passed).length;
+    if (passed === tests.length) parts.push("Your program gave the right output for every test.");
+    else if (passed === 0) parts.push(`Your program did not give the right output for ${tests.length === 1 ? "the test" : `any of the ${tests.length} tests`}.`);
+    else parts.push(`Your program gave the right output for ${passed} of ${tests.length} tests.`);
+    const crash = tests.find((t) => t && t.error);
+    if (crash) {
+      const firstLine = String(crash.error).split("\n").filter(Boolean).pop() || String(crash.error);
+      parts.push(`It stopped with an error: ${firstLine.slice(0, 200)}`);
+    }
+  }
+  let text = String(raw || "")
+    .replace(/\s*\(Anti-Hardcoding Shield active\)/gi, "")
+    .replace(/Passed \d+ of \d+ automated test cases\.?/gi, "")
+    .replace(/AI marked against the mark scheme:\s*/gi, "")
+    .replace(/Marked against the mark scheme:\s*/gi, "")
+    .replace(/\b(The|the) (candidate|student)'s\b/g, (_m, t) => (t === "The" ? "Your" : "your"))
+    .replace(/\b(The|the) (candidate|student)\b/g, (_m, t) => (t === "The" ? "You" : "you"))
+    .replace(/\b(candidate|student)'s\b/gi, "your")
+    .replace(/\b(you|You) (has|is|was|does|fails|uses|implements|prints|outputs|correctly|successfully)\b/g, (_m, y, v) => {
+      const fix: Record<string, string> = { has: "have", is: "are", was: "were", does: "do", fails: "fail", uses: "use", implements: "implement", prints: "print", outputs: "output" };
+      return `${y} ${fix[v] || v}`;
+    })
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text) parts.push(text);
+  if (!parts.length) {
+    parts.push(marks >= maxMarks ? "Well done - full marks." : "Not all marks yet - read the question again and check each requirement.");
+  }
+  return parts.join(" ");
+}
+
+// Student submits assessment (Server-authoritative auto-grading)
+app.post("/api/assessments/:id/submit", async (req, res) => {
+  const { studentId, answers, marks: clientMarks, totalMarks: clientTotal } = req.body;
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a || !a.students[studentId]) {
+    res.status(404).json({ error: "Student session not found" });
+    return;
+  }
+
+  const s = a.students[studentId];
+  // The first submission is final: a second one (another tab, a timer in an old window)
+  // must never replace the marked paper.
+  if (s.status === "submitted" && s.submittedAt && (s as any).markedAt) {
+    if (a.showScoreImmediately === false) {
+      res.json({
+        success: true,
+        confidential: true,
+        studentSession: { studentId: s.studentId, name: s.name, candidateNumber: s.candidateNumber, className: s.className, status: "submitted", submittedAt: s.submittedAt },
+      });
+    } else {
+      res.json({ success: true, studentSession: s });
+    }
+    return;
+  }
+  s.status = "submitted";
+  // Keep everything already saved, and only replace an answer with a non-empty one,
+  // so a submission can never wipe out code or answers that were saved earlier.
+  const isEmptyAnswer = (v: any) =>
+    v === undefined || v === null || (typeof v === "string" && !v.trim()) || (Array.isArray(v) && v.length === 0);
+  const mergedAnswers: Record<string, any> = { ...(s.answers || {}) };
+  if (answers && typeof answers === "object") {
+    const originalOrder = convertAnswersMap(a, studentId, answers, true);
+    for (const [qid, v] of Object.entries(originalOrder)) {
+      if (!isEmptyAnswer(v) || mergedAnswers[qid] === undefined) mergedAnswers[qid] = v;
+    }
+  }
+  s.answers = mergedAnswers;
+  if (!s.submittedAt) s.submittedAt = Date.now();
+  s.lastActiveAt = Date.now();
+  // Save the submitted answers to the database BEFORE marking, so the work is safe even
+  // if marking is slow or the request is cut off (the teacher can then use Re-evaluate).
+  try {
+    await pushSharedState();
+  } catch (err) {
+    console.warn("[submit] Could not save before marking:", err);
+  }
+
+  // Execute authoritative server-side grading using the master unsanitized question bank
+  const enriched = enrichAssessment(a);
+  const masterQuestions = enriched.questions || [];
+  const officialMarks: Record<string, number> = {};
+  let calculatedTotal = 0;
+
+  if (masterQuestions.length) {
+    const replaced = replacedQuestionsFor(a, s).filter((r) => r.task).map((r) => r.task);
+    const result = await markAllQuestions([...masterQuestions, ...replaced], s.answers);
+    Object.assign(officialMarks, result.marks);
+    calculatedTotal = result.total;
+    s.markingNotes = result.notes;
+    (s as any).markBreakdowns = result.points;
+  }
+
+  // If master questions were empty, fallback to client marks safely
+  if (masterQuestions.length === 0 && clientMarks) {
+    s.marks = clientMarks;
+    s.totalMarks = clientTotal !== undefined ? clientTotal : Object.values(clientMarks).reduce((acc: number, m: any) => acc + (m || 0), 0);
+  } else {
+    s.marks = officialMarks;
+    s.totalMarks = calculatedTotal;
+  }
+
+  s.percentage = a.maxMarks > 0 ? Math.round((s.totalMarks / a.maxMarks) * 100) : 0;
+  (s as any).markedAt = Date.now();
+  s.lastActiveAt = Date.now();
+
+  savePersistedAssessments();
+
+  // Confidential assessment policy:
+  // If showScoreImmediately is false (formal exam), DO NOT send back marks or question answers to the student
+  if (a.showScoreImmediately === false) {
+    res.json({
+      success: true,
+      confidential: true,
+      studentSession: {
+        studentId: s.studentId,
+        name: s.name,
+        candidateNumber: s.candidateNumber,
+        className: s.className,
+        status: "submitted",
+        submittedAt: s.submittedAt,
+      },
+    });
+  } else {
+    res.json({ success: true, studentSession: s });
+  }
+});
+
+// ---------- One-time move of all data from the previous database ----------
+const MIGRATED_COLLECTIONS = ["assessments", "students", "custom_questions", "teachers", "settings", "data_files"];
+
+app.get("/api/admin/migration-status", requireTeacher, async (_req, res) => {
+  try {
+    if (!isSharedStoreEnabled() || !hasPreviousDatabase()) {
+      res.json({ available: false });
+      return;
+    }
+    const marker = await getMigrationMarker();
+    res.json({ available: !marker, copiedAt: marker?.at || null, copied: marker?.copied || null });
+  } catch (err: any) {
+    res.json({ available: false, error: err?.message || String(err) });
+  }
+});
+
+app.post("/api/admin/copy-previous-database", requireTeacher, async (_req, res) => {
+  try {
+    if (!isSharedStoreEnabled()) {
+      res.status(400).json({ error: "The shared database is not in use on this server." });
+      return;
+    }
+    const result = await runMigrationOnce();
+    if (result.alreadyDone) {
+      res.status(409).json({ error: "The data was already copied on " + new Date(result.marker.at).toLocaleString() + ". It is not copied twice, so newer work is never replaced." });
+      return;
+    }
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    console.error("[migration] Copy failed:", err);
+    res.status(500).json({ error: "Copy failed: " + explainDatabaseError(err) + " Nothing was lost - you can try again." });
+  }
+});
+
+// Teacher edits the marker's feedback and the mark scheme points for one question
+app.post("/api/assessments/:id/edit-breakdown", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) a = Object.values(assessmentsDb).find((x) => x.code === String(req.params.id).toUpperCase()) as AssessmentStore;
+  const { studentId, questionId, feedback, points, applyMark } = req.body || {};
+  if (!a || !a.students || !a.students[studentId] || !questionId) {
+    res.status(404).json({ error: "Student or question not found" });
+    return;
+  }
+  const s: any = a.students[studentId];
+  if (feedback !== undefined) {
+    s.markingNotes = { ...(s.markingNotes || {}) };
+    const text = String(feedback || "").trim().slice(0, 4000);
+    if (text) s.markingNotes[questionId] = text;
+    else delete s.markingNotes[questionId];
+  }
+  if (points !== undefined) {
+    const clean = normalizeMarkPoints(Array.isArray(points) ? points : []);
+    s.markBreakdowns = { ...(s.markBreakdowns || {}) };
+    if (clean.length) s.markBreakdowns[questionId] = clean;
+    else delete s.markBreakdowns[questionId];
+    if (applyMark) {
+      const q = (enrichAssessment(a).questions || []).find((x: any) => x && x.id === questionId);
+      const qMax = Number(q?.marks) || Infinity;
+      const total = clean.reduce((acc, p) => acc + p.awarded, 0);
+      s.marks = { ...(s.marks || {}), [questionId]: Math.max(0, Math.min(qMax, Math.round(total * 10) / 10)) };
+      s.totalMarks = Object.values(s.marks).reduce((acc: number, m: any) => acc + (Number(m) || 0), 0);
+      s.percentage = a.maxMarks > 0 ? Math.round((s.totalMarks / a.maxMarks) * 100) : 0;
+    }
+  }
+  savePersistedAssessments();
+  res.json({ success: true, studentSession: s });
+});
+
+// ---------- Comment per question: what went wrong and how to improve ----------
+function answerAsText(answer: any): string {
+  if (answer === undefined || answer === null) return "";
+  if (typeof answer === "string") return answer;
+  try {
+    return JSON.stringify(answer);
+  } catch {
+    return String(answer);
+  }
+}
+
+/**
+ * Comment for one question as bullet points: one bullet for each mark the student lost,
+ * saying which mark scheme point it was, why it was lost and how to fix it.
+ * Returned as text, one bullet per line ("• ..."), so the teacher can keep or delete each.
+ */
+async function suggestQuestionComment(
+  task: any,
+  answer: any,
+  awarded: number,
+  maxMarks: number,
+  note: string,
+  points: MarkPoint[] = []
+): Promise<string> {
+  const answerText = answerAsText(answer).trim();
+  const lost = Math.max(0, Math.round((maxMarks - awarded) * 10) / 10);
+  const asBullets = (items: string[]) =>
+    items
+      .map((b) => String(b || "").replace(/^\s*[•\-*]\s*/, "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .map((b) => "• " + b)
+      .join("\n");
+  const fallback = () => {
+    if (!answerText) return asBullets([`Lost ${lost} mark${lost === 1 ? "" : "s"} - no answer was given. Attempt every part: even a partial answer can earn marks.`]);
+    const missed = (points || []).filter((p) => p.awarded < p.max);
+    if (missed.length) {
+      return asBullets(
+        missed.map((p) => {
+          const n = Math.round((p.max - p.awarded) * 10) / 10;
+          return `Lost ${n} mark${n === 1 ? "" : "s"} - ${p.point}${p.reason ? `: ${p.reason}` : ""}`;
+        })
+      );
+    }
+    const cleanNote = String(note || "").replace(/\s*\(Anti-Hardcoding Shield active\)/gi, "").replace(/\s+/g, " ").trim();
+    return asBullets([
+      `Lost ${lost} mark${lost === 1 ? "" : "s"}${cleanNote ? ` - ${cleanNote.slice(0, 300)}` : ""}`,
+      "Check your answer against each point in the mark scheme and make sure every required step is included.",
+    ]);
+  };
+  const ai = getGeminiClient();
+  if (!ai) return fallback();
+
+  // For programs, run the tests so the comment can name the exact problem
+  let testInfo = "";
+  if (task.type === "code" && answerText && Array.isArray(task.tests) && task.tests.length) {
+    try {
+      const results = await runPythonTests(answerText, task.tests.map((t: any) => t.in || []), getFilesForTask(task));
+      if (results) {
+        testInfo = task.tests
+          .slice(0, 6)
+          .map((t: any, i: number) => {
+            const r = results[i] || { out: "", err: null };
+            const ok = !r.err && compareOutputs(r.out || "", String(t.out ?? ""));
+            return `Test ${i + 1}: inputs ${JSON.stringify(t.in || [])}\nExpected: ${String(t.out ?? "").slice(0, 300)}\nStudent output: ${String(r.out || "").slice(0, 300)}${r.err ? `\nError: ${String(r.err).slice(0, 300)}` : ""}\nResult: ${ok ? "PASS" : "FAIL"}`;
+          })
+          .join("\n\n");
+      }
+    } catch {}
+  }
+
+  const ms = collectMarkScheme(task);
+  const prompt = `You are a supportive, precise IB Diploma Programme Computer Science teacher writing feedback to a student about ONE question on which they lost marks.
+Use IB language: refer to the command term in the question (e.g. "Explain needs a reason, not just a statement") and to the markscheme points.
+
+QUESTION:
+${describeQuestion(task).slice(0, 4000)}
+
+MARK SCHEME / EXPECTED ANSWER:
+${(ms.text || "").slice(0, 3000)}
+${ms.markPoints.length ? JSON.stringify(ms.markPoints).slice(0, 2000) : ""}
+${task.solution ? "MODEL SOLUTION:\n" + String(task.solution).slice(0, 2500) : ""}
+
+STUDENT'S ANSWER:
+${answerText.slice(0, 4000) || "(no answer)"}
+
+MARKS: ${awarded} out of ${maxMarks}
+AUTOMATIC MARKING NOTE: ${(note || "").slice(0, 800)}
+${testInfo ? "TEST RESULTS:\n" + testInfo : ""}
+
+${points && points.length ? "MARK SCHEME POINTS AS MARKED:\n" + points.map((p) => `- ${p.point}: ${p.awarded}/${p.max}${p.reason ? " (" + p.reason + ")" : ""}`).join("\n") : ""}
+
+The student lost ${lost} mark(s). Write feedback as BULLET POINTS, addressed to the student ("you"), marked against the mark scheme:
+- One bullet for EACH mark (or mark scheme point) that was lost - ${lost} bullet(s) in total, no more.
+- Each bullet: start with "Lost 1 mark - " then the mark scheme point, then exactly why THIS answer did not earn it (name the line, check, output or missing idea), then a short "Fix:" with what to do.
+- One sentence or two per bullet, plain English. No bullets for marks that were earned. Do not give away a complete model answer.
+
+Return JSON: {"bullets": ["Lost 1 mark - ...", "..."]}`;
+  try {
+    const response = await generateContentWithResilience(ai, {
+      contents: prompt,
+      config: { responseMimeType: "application/json" },
+      maxWaitMs: 45_000,
+      perCallTimeoutMs: 30_000,
+    });
+    const parsed = JSON.parse(response.text?.trim() || "{}");
+    const bullets: string[] = Array.isArray(parsed.bullets) ? parsed.bullets.map(String) : parsed.comment ? [String(parsed.comment)] : [];
+    const text = asBullets(bullets);
+    return text || fallback();
+  } catch (err) {
+    console.warn("[comments] AI suggestion failed:", (err as any)?.message || err);
+    return fallback();
+  }
+}
+
+// Suggest comments for the questions where a student lost marks (optionally save them)
+app.post("/api/assessments/:id/suggest-comments", requireTeacher, async (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  const { studentId, questionIds, save, overwrite } = req.body || {};
+  if (!a || !a.students || !a.students[studentId]) {
+    res.status(404).json({ error: "Student not found" });
+    return;
+  }
+  const s = a.students[studentId];
+  const enriched = enrichAssessment(a);
+  const questions: any[] = [
+    ...(enriched.questions || []),
+    ...replacedQuestionsFor(a, s).filter((r) => r.task).map((r) => ({ ...r.task, id: r.id })),
+  ];
+  const wanted = Array.isArray(questionIds) && questionIds.length ? new Set(questionIds.map(String)) : null;
+  const targets = questions.filter((q) => {
+    if (!q || !q.id) return false;
+    if (wanted) return wanted.has(q.id);
+    const max = Number(q.marks) || 0;
+    const got = Number((s.marks || {})[q.id] ?? 0);
+    // A new question this student never did (they did the version it replaced): nothing to comment on
+    if (isBlankAnswer((s.answers || {})[q.id]) && replacedQuestionsFor(a, s).length) return false;
+    return max > 0 && got < max; // only questions that lost marks
+  });
+
+  const comments: Record<string, string> = {};
+  const started = Date.now();
+  let i = 0;
+  const worker = async () => {
+    while (i < targets.length && Date.now() - started < 200_000) {
+      const q = targets[i++];
+      const max = Number(q.marks) || 0;
+      const got = Number((s.marks || {})[q.id] ?? 0);
+      comments[q.id] = await suggestQuestionComment(
+        q,
+        (s.answers || {})[q.id],
+        got,
+        max,
+        (s.markingNotes || {})[q.id] || "",
+        ((s as any).markBreakdowns || {})[q.id] || []
+      );
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, targets.length) }, worker));
+
+  if (save) {
+    s.questionComments = { ...(s.questionComments || {}) };
+    for (const [qid, text] of Object.entries(comments)) {
+      if (overwrite || !s.questionComments[qid]) s.questionComments[qid] = text;
+    }
+    savePersistedAssessments();
+  }
+  res.json({ success: true, comments, studentSession: s, skipped: targets.length - Object.keys(comments).length });
+});
+
+// Teacher removes one student's attempt (e.g. joined twice, wrong name, or to let them start again)
+app.delete("/api/assessments/:id/students/:studentId", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+  const sid = req.params.studentId;
+  if (!a.students || !a.students[sid]) {
+    res.status(404).json({ error: "Student not found" });
+    return;
+  }
+  const removedName = a.students[sid].name;
+  delete a.students[sid];
+  savePersistedAssessments();
+  res.json({ success: true, removed: sid, name: removedName });
+});
+
+// Teacher views live progress & analytics (Protected with requireTeacher)
+// Combined results: the submitted scores of several assessments, for merging into one mark/grade per student
+app.post("/api/combined-results", requireTeacher, (req, res) => {
+  const ids: string[] = Array.isArray(req.body?.ids) ? req.body.ids.slice(0, 12).map(String) : [];
+  const out = ids
+    .map((id) => assessmentsDb[id] || (Object.values(assessmentsDb).find((x) => x.code === id.toUpperCase()) as AssessmentStore))
+    .filter(Boolean)
+    .map((a: any) => ({
+      id: a.id,
+      title: a.title,
+      ibLevel: a.ibLevel,
+      code: a.code,
+      type: a.type || "assessment",
+      maxMarks: a.maxMarks || 0,
+      createdAt: a.createdAt || 0,
+      classGroup: a.classGroup || "",
+      gradeBoundaries: a.gradeBoundaries || null,
+      students: Object.values(a.students || {}).map((s: any) => ({
+        studentId: s.studentId,
+        name: s.name,
+        className: s.className || a.classGroup || "",
+        candidateNumber: s.candidateNumber || "",
+        status: s.status,
+        totalMarks: Number(s.totalMarks) || 0,
+        maxMarks: Number(s.maxMarks) || a.maxMarks || 0,
+        submittedAt: s.submittedAt || 0,
+      })),
+    }));
+  res.json({ assessments: out });
+});
+
+app.get("/api/assessments/:id/live", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const studentsList = Object.values(a.students).sort((x, y) => x.name.localeCompare(y.name));
+  const submitted = studentsList.filter((s) => s.status === "submitted");
+  const inProgress = studentsList.filter((s) => s.status === "in_progress");
+
+  const avgScore = submitted.length
+    ? Math.round(submitted.reduce((acc, s) => acc + s.totalMarks, 0) / submitted.length)
+    : 0;
+  const avgPercentage = a.maxMarks > 0 ? Math.round((avgScore / a.maxMarks) * 100) : 0;
+
+  // Question difficulty analysis
+  const questionAnalytics: Record<string, { totalAwarded: number; attempts: number; averageMarks: number }> = {};
+  for (const qId of a.questionIds) {
+    let totalAwarded = 0;
+    let attempts = 0;
+    for (const s of studentsList) {
+      if (s.marks && s.marks[qId] !== undefined) {
+        totalAwarded += s.marks[qId];
+        attempts++;
+      }
+    }
+    questionAnalytics[qId] = {
+      totalAwarded,
+      attempts,
+      averageMarks: attempts ? Number((totalAwarded / attempts).toFixed(1)) : 0,
+    };
+  }
+
+  // Questions taken out of the assessment that some students had already answered
+  const replacedMap: Record<string, any> = {};
+  for (const st of studentsList as any[]) {
+    for (const r of replacedQuestionsFor(a, st)) {
+      if (!replacedMap[r.id]) {
+        replacedMap[r.id] = r.task
+          ? { ...r.task, id: r.id }
+          : { id: r.id, title: "Question removed from this assessment", marks: undefined, type: "unknown" };
+      }
+    }
+  }
+
+  res.json({
+    assessment: a,
+    replacedQuestions: Object.values(replacedMap),
+    students: studentsList,
+    stats: {
+      totalJoined: studentsList.length,
+      inProgressCount: inProgress.length,
+      submittedCount: submitted.length,
+      avgScore,
+      avgPercentage,
+      maxMarks: a.maxMarks,
+    },
+    releaseSettings: a.releaseSettings || {
+      resultsReleased: false,
+      shareTotalScore: true,
+      shareQuestionMarks: true,
+      shareMarkScheme: true,
+      shareSubmissionsAndAnswers: true,
+      shareTeacherFeedback: true,
+      shareReflectionSheet: true,
+    },
+    questionAnalytics,
+  });
+});
+
+// Teacher manual override / feedback (Protected with requireTeacher)
+app.post("/api/assessments/:id/override-mark", requireTeacher, (req, res) => {
+  const { studentId, questionId, mark, feedback, questionComment } = req.body;
+  const a = assessmentsDb[req.params.id];
+  if (!a || !a.students[studentId]) {
+    res.status(404).json({ error: "Session not found" });
+    return;
+  }
+
+  const s = a.students[studentId];
+  if (questionId && mark !== undefined) {
+    s.marks[questionId] = Number(mark);
+    s.totalMarks = Object.values(s.marks).reduce((acc, m) => acc + (m || 0), 0);
+    s.percentage = a.maxMarks > 0 ? Math.round((s.totalMarks / a.maxMarks) * 100) : 0;
+  }
+  if (feedback !== undefined) {
+    s.feedback = feedback;
+  }
+  if (questionId && questionComment !== undefined) {
+    const text = String(questionComment || "").trim().slice(0, 4000);
+    s.questionComments = { ...(s.questionComments || {}) };
+    if (text) s.questionComments[questionId] = text;
+    else delete s.questionComments[questionId];
+  }
+
+  savePersistedAssessments();
+  res.json({ success: true, studentSession: s });
+});
+
+// Teacher updates reflection sheet fields directly (Protected with requireTeacher)
+app.post("/api/assessments/:id/update-reflection-sheet", requireTeacher, (req, res) => {
+  const { studentId, reflectionSheet } = req.body;
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a || !a.students[studentId]) {
+    res.status(404).json({ error: "Candidate session not found" });
+    return;
+  }
+
+  const s = a.students[studentId];
+  s.reflectionSheet = {
+    ...(s.reflectionSheet || {}),
+    ...(reflectionSheet || {}),
+    updatedAt: Date.now(),
+  };
+
+  savePersistedAssessments();
+  res.json({ success: true, reflectionSheet: s.reflectionSheet, studentSession: s });
+});
+
+// Re-evaluate a student against latest question mark schemes & tests (Protected with requireTeacher)
+app.post("/api/assessments/:id/regrade-student", requireTeacher, async (req, res) => {
+  const { studentId } = req.body;
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a || !a.students[studentId]) {
+    res.status(404).json({ error: "Student session not found" });
+    return;
+  }
+
+  const s = a.students[studentId];
+  const enriched = enrichAssessment(a);
+  const masterQuestions = enriched.questions || [];
+  const officialMarks: Record<string, number> = {};
+  let calculatedTotal = 0;
+
+  if (masterQuestions.length) {
+    const replaced = replacedQuestionsFor(a, s).filter((r) => r.task).map((r) => r.task);
+    const result = await markAllQuestions([...masterQuestions, ...replaced], s.answers || {});
+    Object.assign(officialMarks, result.marks);
+    calculatedTotal = result.total;
+    s.markingNotes = result.notes;
+    (s as any).markBreakdowns = result.points;
+  }
+
+  s.marks = officialMarks;
+  s.totalMarks = calculatedTotal;
+  s.percentage = a.maxMarks > 0 ? Math.round((s.totalMarks / a.maxMarks) * 100) : 0;
+  if (s.status === "submitted") (s as any).markedAt = Date.now();
+  savePersistedAssessments();
+
+  res.json({ success: true, studentSession: s });
+});
+
+// Teacher generates AI diagnostic feedback (Protected with requireTeacher)
+app.post("/api/assessments/:id/generate-student-feedback", requireTeacher, async (req, res) => {
+  try {
+    const { studentId } = req.body;
+    const a = assessmentsDb[req.params.id];
+    if (!a || !a.students[studentId]) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    const s = a.students[studentId];
+    const questionKeys = a.questionIds || Object.keys(s.answers || {});
+
+    // Collect questions where student struggled
+    const performanceData = questionKeys.map((qId) => {
+      const awarded = s.marks ? s.marks[qId] ?? 0 : 0;
+      const answer = s.answers ? s.answers[qId] : null;
+      return {
+        questionId: qId,
+        awardedMarks: awarded,
+        answer: typeof answer === "string" ? answer : JSON.stringify(answer),
+      };
+    });
+
+    const ai = getGeminiClient();
+    if (ai) {
+      try {
+        const prompt = `You are ${IB_EXAMINER_ROLE}, acting as a teacher diagnostic assistant.
+
+Assessment Title: "${a.title}"${(a as any).ibLevel ? ` (${(a as any).ibLevel})` : ""}
+Candidate: ${s.name} (${s.candidateNumber})
+Total Score: ${s.totalMarks} / ${a.maxMarks} (${s.percentage}%)
+
+Performance Record:
+${JSON.stringify(performanceData, null, 2)}
+
+${IB_SCOPE_TEXT}
+
+Task:
+Analyze where the student lost marks or went wrong. Provide targeted diagnostic feedback focused strictly on the IB DP Computer Science syllabus topics (A1-A4, B1-B4, case study) they must review, including command-term technique (e.g. "Explain" answers that only state).
+Return ONLY valid JSON matching this exact structure:
+{
+  "overallSummary": "Concise 2-3 sentence overview of candidate performance, strengths, and primary revision priority.",
+  "focusTopics": ["Exact IB syllabus reference to prioritize (e.g. B2.3.3: Loop boundaries and range() parameters)"],
+  "questionBreakdowns": [
+    {
+      "questionId": "id string",
+      "marksAwarded": 2,
+      "maxMarks": 5,
+      "studentError": "Analysis of the specific misconception or error in their submission",
+      "specTopic": "IB syllabus reference (e.g. A2.3.3 Packet switching)",
+      "revisionAction": "Actionable practice step for the candidate to correct this weakness"
+    }
+  ]
+}`;
+
+        const aiResponse = await generateContentWithResilience(ai, {
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+          },
+        });
+
+        const text = aiResponse.text || "{}";
+        const parsed = JSON.parse(text);
+        s.aiDiagnostic = parsed;
+        res.json({ success: true, aiDiagnostic: parsed, method: "gemini" });
+        return;
+      } catch (geminiErr: any) {
+        console.info("Gemini diagnostic capacity peak/spikes; delivering the IB syllabus diagnostic fallback.");
+      }
+    }
+
+    // High quality syllabus-grounded fallback
+    const fallbackDiagnostic = {
+      overallSummary: `Candidate ${s.name} scored ${s.totalMarks}/${a.maxMarks} (${s.percentage}%). Targeted review recommended on logic structure and algorithmic syntax.`,
+      focusTopics: [
+        "B2.3.2: Selection structures with Boolean and relational operators",
+        "B2.1.4: Trace tables and debugging techniques",
+        "A1.2.1: Representing data in binary and hexadecimal",
+      ],
+      questionBreakdowns: performanceData
+        .filter((p) => p.awardedMarks < 4)
+        .map((p) => ({
+          questionId: p.questionId,
+          marksAwarded: p.awardedMarks,
+          maxMarks: 4,
+          studentError: "Suboptimal condition logic or incomplete trace table iteration values.",
+          specTopic: "B2.3 Programming constructs: selection and looping structures",
+          revisionAction: "Practice tracing loop termination conditions using dry-run trace tables before coding.",
+        })),
+    };
+
+    s.aiDiagnostic = fallbackDiagnostic;
+    res.json({ success: true, aiDiagnostic: fallbackDiagnostic, method: "syllabus-rules" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to generate diagnostic feedback" });
+  }
+});
+
+// Teacher views current release configuration
+app.get("/api/assessments/:id/release-settings", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const defaultSettings: ResultReleaseSettings = {
+    resultsReleased: a.type === "task",
+    shareTotalScore: true,
+    shareQuestionMarks: true,
+    shareMarkScheme: true,
+    shareSubmissionsAndAnswers: true,
+    shareTeacherFeedback: true,
+    shareReflectionSheet: true,
+  };
+
+  res.json({
+    success: true,
+    releaseSettings: a.releaseSettings || defaultSettings,
+  });
+});
+
+// Teacher configures release options (which components to share with students)
+app.post("/api/assessments/:id/release-settings", requireTeacher, (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const prev = a.releaseSettings || {
+    resultsReleased: false,
+    shareTotalScore: true,
+    shareQuestionMarks: true,
+    shareMarkScheme: true,
+    shareSubmissionsAndAnswers: true,
+    shareTeacherFeedback: true,
+    shareReflectionSheet: true,
+  };
+
+  const updated: ResultReleaseSettings = {
+    resultsReleased: req.body.resultsReleased !== undefined ? !!req.body.resultsReleased : prev.resultsReleased,
+    shareTotalScore: req.body.shareTotalScore !== undefined ? !!req.body.shareTotalScore : prev.shareTotalScore,
+    shareQuestionMarks: req.body.shareQuestionMarks !== undefined ? !!req.body.shareQuestionMarks : prev.shareQuestionMarks,
+    shareMarkScheme: req.body.shareMarkScheme !== undefined ? !!req.body.shareMarkScheme : prev.shareMarkScheme,
+    shareSubmissionsAndAnswers:
+      req.body.shareSubmissionsAndAnswers !== undefined
+        ? !!req.body.shareSubmissionsAndAnswers
+        : prev.shareSubmissionsAndAnswers,
+    shareTeacherFeedback:
+      req.body.shareTeacherFeedback !== undefined ? !!req.body.shareTeacherFeedback : prev.shareTeacherFeedback,
+    shareReflectionSheet:
+      req.body.shareReflectionSheet !== undefined ? !!req.body.shareReflectionSheet : prev.shareReflectionSheet,
+    releasedAt: req.body.resultsReleased ? (req.body.releasedAt || Date.now()) : prev.releasedAt,
+    releasedStudentIds: Array.isArray(req.body.releasedStudentIds)
+      ? req.body.releasedStudentIds
+      : prev.releasedStudentIds,
+  };
+
+  a.releaseSettings = updated;
+  savePersistedAssessments();
+
+  res.json({
+    success: true,
+    releaseSettings: updated,
+    message: updated.resultsReleased ? "Results successfully released to students" : "Results unreleased (confidential)",
+  });
+});
+
+// Helper to format student result with selective teacher release masking
+function buildStudentResultPayload(a: AssessmentStore, s: LiveStudentSession) {
+  const isPracticeTask = a.type === "task";
+  const releaseSettings: ResultReleaseSettings = a.releaseSettings || {
+    resultsReleased: isPracticeTask,
+    shareTotalScore: true,
+    shareQuestionMarks: true,
+    shareMarkScheme: true,
+    shareSubmissionsAndAnswers: true,
+    shareTeacherFeedback: true,
+    shareReflectionSheet: true,
+  };
+
+  const isReleasedForThisStudent =
+    isPracticeTask ||
+    (releaseSettings.resultsReleased &&
+      (!releaseSettings.releasedStudentIds ||
+        releaseSettings.releasedStudentIds.length === 0 ||
+        releaseSettings.releasedStudentIds.includes(s.studentId) ||
+        releaseSettings.releasedStudentIds.includes(s.candidateNumber)));
+
+  if (!isReleasedForThisStudent) {
+    return {
+      resultsReleased: false,
+      message: "Results are currently being moderated by your teacher. You will be able to review your marks, examiner mark scheme, and reflection sheet once your teacher releases them.",
+      student: {
+        studentId: s.studentId,
+        name: s.name,
+        candidateNumber: s.candidateNumber,
+        className: s.className,
+        status: s.status,
+        submittedAt: s.submittedAt,
+      },
+    };
+  }
+
+  // Get up-to-date question definitions
+  const enriched = enrichAssessment(a);
+  // Each student sees the version of the paper they actually did: if questions were
+  // replaced after they answered them, their original questions take the place of the
+  // new ones they did not answer.
+  let masterQuestions: any[] = enriched.questions || [];
+  const replacedDone = replacedQuestionsFor(a, s).filter((r) => r.task).map((r) => ({ ...r.task, id: r.id }));
+  if (replacedDone.length) {
+    const queue = [...replacedDone];
+    const ordered: any[] = [];
+    for (const q of masterQuestions) {
+      if (queue.length && isBlankAnswer((s.answers || {})[q.id])) ordered.push(queue.shift());
+      else ordered.push(q);
+    }
+    masterQuestions = [...ordered, ...queue];
+  }
+
+  const canShareSolutions = a.type === "task" || (a.shareSolutions !== false && releaseSettings.shareMarkScheme);
+
+  const sanitizedQuestions = masterQuestions.map((q) => {
+    const qCopy = { ...q };
+    // If teacher turned OFF solution / mark scheme sharing, delete solution, markScheme, markPoints, why
+    if (!canShareSolutions) {
+      delete qCopy.solution;
+      delete qCopy.markScheme;
+      delete qCopy.markPoints;
+      delete qCopy.why;
+    }
+    return qCopy;
+  });
+
+  const studentData: Partial<LiveStudentSession> & Record<string, any> = {
+    studentId: s.studentId,
+    name: s.name,
+    candidateNumber: s.candidateNumber,
+    className: s.className,
+    status: s.status,
+    submittedAt: s.submittedAt,
+  };
+
+  if (releaseSettings.shareTotalScore) {
+    studentData.totalMarks = s.totalMarks;
+    studentData.maxMarks = a.maxMarks;
+    studentData.percentage = s.percentage;
+  }
+
+  if (releaseSettings.shareQuestionMarks) {
+    studentData.marks = s.marks;
+    studentData.markBreakdowns = (s as any).markBreakdowns;
+  }
+
+  if (releaseSettings.shareSubmissionsAndAnswers) {
+    studentData.answers = s.answers;
+  }
+
+  if (releaseSettings.shareTeacherFeedback) {
+    studentData.feedback = s.feedback;
+    studentData.questionComments = s.questionComments;
+    // Written for the student ("you"), without marker jargon
+    studentData.markingNotes = Object.fromEntries(
+      Object.entries((s as any).markingNotes || {})
+        .filter(([, v]) => typeof v === "string" && (v as string).trim())
+        .map(([k, v]) => [k, studentFriendlyFeedback(String(v), undefined, 0, 1)])
+    );
+    studentData.aiDiagnostic = s.aiDiagnostic;
+  }
+
+  if (releaseSettings.shareReflectionSheet !== false) {
+    studentData.reflectionSheet = s.reflectionSheet;
+  }
+
+  return {
+    resultsReleased: true,
+    releaseSettings,
+    assessment: {
+      id: a.id,
+      title: a.title,
+      ibLevel: (a as any).ibLevel,
+      code: a.code,
+      type: a.type,
+      headerConfig: a.headerConfig,
+      shareSolutions: a.shareSolutions,
+      instantFeedback: Boolean(a.instantFeedback),
+      feedbackDetail: a.feedbackDetail || "tests",
+      maxChecks: a.maxChecks ?? 3,
+      classGroup: a.classGroup || undefined,
+      maxMarks: a.maxMarks,
+      durationMinutes: a.durationMinutes,
+      questionIds: masterQuestions.map((q: any) => q.id),
+      questions: sanitizedQuestions,
+      gradeBoundaries: a.gradeBoundaries,
+    },
+    student: studentData,
+    reflectionSheetAllowed: releaseSettings.shareReflectionSheet !== false,
+  };
+}
+
+// Student views released results, mark scheme, and reflection
+app.get("/api/assessments/:id/student-result/:studentId", (req, res) => {
+  let a = assessmentsDb[req.params.id];
+  if (!a) {
+    a = Object.values(assessmentsDb).find((x) => x.code === req.params.id.toUpperCase()) as AssessmentStore;
+  }
+  if (!a) {
+    res.status(404).json({ error: "Assessment not found" });
+    return;
+  }
+
+  const studentId = req.params.studentId;
+  const cleanTarget = studentId.trim().toLowerCase();
+  const s =
+    a.students[studentId] ||
+    Object.values(a.students).find(
+      (st) =>
+        st.studentId?.toLowerCase() === cleanTarget ||
+        st.name?.trim().toLowerCase() === cleanTarget ||
+        st.candidateNumber?.trim().toLowerCase() === cleanTarget
+    );
+
+  if (!s) {
+    res.status(404).json({ error: "Candidate record not found in this assessment" });
+    return;
+  }
+
+  const payload = buildStudentResultPayload(a, s);
+  res.json({ success: true, ...payload });
+});
+
+// Student lookup by assessment PIN and candidate number
+app.post("/api/assessments/lookup-result", (req, res) => {
+  const { code, candidateNumber } = req.body;
+  if (!code || !candidateNumber) {
+    res.status(400).json({ error: "Assessment code and candidate number are required" });
+    return;
+  }
+
+  const cleanCode = String(code).trim().toUpperCase();
+  const cleanCand = String(candidateNumber).trim().toLowerCase();
+
+  const a = Object.values(assessmentsDb).find((x) => x.code === cleanCode || x.id === code);
+  if (!a) {
+    res.status(404).json({ error: "Assessment code not found. Please verify the PIN." });
+    return;
+  }
+
+  const s = Object.values(a.students).find(
+    (st) =>
+      st.candidateNumber?.trim().toLowerCase() === cleanCand ||
+      st.studentId?.trim().toLowerCase() === cleanCand ||
+      st.name?.trim().toLowerCase() === cleanCand
+  );
+
+  if (!s) {
+    res.status(404).json({ error: `Student "${candidateNumber}" not found for assessment ${a.title}` });
+    return;
+  }
+
+  const payload = buildStudentResultPayload(a, s);
+  res.json({ success: true, ...payload });
+});
+
+// Restore data from disk (the IB app has no seed / demo assessments)
+function seedInitialData() {
+  loadPersistedData();
+}
+
+seedInitialData();
+
+// ---------- Learning Hub (lessons, classes, progress) ----------
+loadLearnData(DATA_DIR);
+registerLearnRoutes(app, { requireTeacher, runPythonTests, defaultFiles: VIRTUAL_FILES });
+
+// ---------- IA tracker ----------
+loadIAData(DATA_DIR);
+registerIARoutes(app, { requireTeacher });
+
+// ---------- Shared state collections (see serverStore.ts) ----------
+let sharedCollections: SyncedCollection[] | null = null;
+let pullInFlight: Promise<void> | null = null;
+let pushChain: Promise<void> = Promise.resolve();
+
+function initSharedCollections() {
+  const assessments = new SyncedCollection(
+    "assessments",
+    () => {
+      const out: Record<string, any> = {};
+      for (const [id, a] of Object.entries(assessmentsDb)) {
+        const { students, ...rest } = a as any;
+        out[id] = rest;
+      }
+      return out;
+    },
+    (id, value) => {
+      if (value === null) {
+        delete assessmentsDb[id];
+      } else {
+        assessmentsDb[id] = { ...value, students: assessmentsDb[id]?.students || {} };
+      }
+    }
+  );
+
+  const students = new SyncedCollection(
+    "students",
+    () => {
+      const out: Record<string, any> = {};
+      for (const [aid, a] of Object.entries(assessmentsDb)) {
+        for (const [sid, s] of Object.entries(a.students || {})) {
+          out[`${aid}::${sid}`] = s;
+        }
+      }
+      return out;
+    },
+    (key, value) => {
+      const sep = key.indexOf("::");
+      if (sep < 0) return;
+      const aid = key.slice(0, sep);
+      const sid = key.slice(sep + 2);
+      const a = assessmentsDb[aid];
+      if (!a) return;
+      if (!a.students) a.students = {};
+      if (value === null) delete a.students[sid];
+      else a.students[sid] = value;
+    },
+    {
+      // In-progress answers: save at most every 90s per student (the browser keeps
+      // the answers and sends them all on submit, so nothing is lost)
+      writeDelayMs: (_id, v) => (v && v.status === "in_progress" ? Number(process.env.PROGRESS_SAVE_DELAY_MS) || 15_000 : 0),
+      // A server copy that hasn't seen the submission must never undo it
+      needsOverwriteCheck: (_id, v) => !v || v.status !== "submitted",
+      shouldOverwrite: (_id, _local, remote) => !(remote && remote.status === "submitted"),
+    }
+  );
+
+  const questions = new SyncedCollection(
+    "custom_questions",
+    () => customQuestionsDb,
+    (id, value) => {
+      if (value === null) delete customQuestionsDb[id];
+      else customQuestionsDb[id] = value;
+    }
+  );
+
+  const teachers = new SyncedCollection(
+    "teachers",
+    () => teachersDb,
+    (id, value) => {
+      if (value === null) delete teachersDb[id];
+      else teachersDb[id] = value;
+    }
+  );
+
+  const settings = new SyncedCollection(
+    "settings",
+    () => ({ main: systemSettings }),
+    (_id, value) => {
+      if (value) Object.assign(systemSettings, value);
+    }
+  );
+
+  const dataFiles = new SyncedCollection(
+    "data_files",
+    () => dataFilesDb,
+    (id, value) => {
+      if (value === null) delete dataFilesDb[id];
+      else dataFilesDb[id] = value;
+    }
+  );
+
+  const learnClasses = new SyncedCollection(
+    "learn_classes",
+    () => learnClassesDb,
+    (id, value) => {
+      if (value === null) delete learnClassesDb[id];
+      else learnClassesDb[id] = value;
+    }
+  );
+
+  const learnProgress = new SyncedCollection(
+    "learn_progress",
+    () => learnProgressDb,
+    (id, value) => {
+      if (value === null) delete learnProgressDb[id];
+      else learnProgressDb[id] = value;
+    }
+  );
+
+  const iaClasses = new SyncedCollection("ia_classes", () => iaClassesDb, (id, value) => {
+    if (value === null) delete iaClassesDb[id];
+    else iaClassesDb[id] = value;
+  });
+  const iaProjects = new SyncedCollection("ia_projects", () => iaProjectsDb, (id, value) => {
+    if (value === null) delete iaProjectsDb[id];
+    else iaProjectsDb[id] = value;
+  });
+
+  // Order matters: assessments must be pulled before their students.
+  sharedCollections = [assessments, students, questions, teachers, settings, dataFiles, learnClasses, learnProgress, iaClasses, iaProjects];
+  for (const c of sharedCollections) c.captureBaseline();
+}
+
+// How long data already in memory is reused before checking the database again.
+// Every check costs at least one Firestore read per collection, and the free plan
+// allows ~50,000 reads a day, so routine requests reuse recent data.
+const HOT_COLLECTIONS = new Set(["assessments", "students", "learn_classes", "learn_progress", "ia_classes", "ia_projects"]);
+const HOT_TTL_MS = 15_000; // assessments + student progress
+const COLD_TTL_MS = 60_000; // teachers, settings, question bank, data files
+
+async function pullSharedState(fresh: boolean | "all" = true, includeStudents = true): Promise<void> {
+  if (!sharedCollections) return;
+  if (pullInFlight) {
+    await pullInFlight;
+    if (!fresh) return;
+  }
+  const now = Date.now();
+  const due = sharedCollections.filter((c) => {
+    // Student records are only needed by teacher views (live/results) and joins;
+    // a student's autosave/submit carries all of that student's answers itself.
+    if (c.name === "students" && !includeStudents && c.lastPullAt) return false;
+    if (!c.lastPullAt) return true;
+    const hot = HOT_COLLECTIONS.has(c.name);
+    // "fresh": always re-check exam data; teacher/bank/settings data only for teacher requests
+    if (fresh === true && hot) return true;
+    if (fresh === "all") return true;
+    const ttl = hot ? HOT_TTL_MS : COLD_TTL_MS;
+    return now - c.lastPullAt >= ttl;
+  });
+  if (!due.length) return;
+  pullInFlight = (async () => {
+    for (const c of due) await c.pull();
+  })().finally(() => {
+    pullInFlight = null;
+  });
+  return pullInFlight;
+}
+
+/** Fresh data for anything that changes state or refers to something this server hasn't seen. */
+function needsFreshData(req: express.Request): boolean | "all" {
+  // Teacher actions (they send a login token) and logins see everything fresh
+  if (req.method !== "GET" && (req.headers.authorization || /^\/teacher\//.test(req.path))) return "all";
+  // Teacher screens re-check exam data on every request, so a change saved through one
+  // server copy (e.g. grade boundaries) never shows the old value from another copy
+  if (req.headers.authorization) return true;
+  // Learning Hub student requests: fresh only when the class/student is new to this server copy
+  if (/^\/learn\//.test(req.path)) return learnNeedsFresh(req);
+  if (/^\/ia\//.test(req.path)) return iaNeedsFresh(req);
+  // Student requests (join, autosave, submit) use data at most 15s old, unless they refer
+  // to an assessment or student this server copy hasn't seen yet (checked below).
+  const m = req.path.match(/^\/assessments\/([^/]+)/);
+  if (m) {
+    const key = decodeURIComponent(m[1]);
+    const a =
+      assessmentsDb[key] || Object.values(assessmentsDb).find((x) => x.code === String(key).toUpperCase());
+    if (!a) return true; // created on another server instance moments ago
+    const sid = req.body?.studentId;
+    if (sid && !(a.students || {})[sid]) return true; // student joined on another instance
+  }
+  return false;
+}
+
+async function pushSharedState(): Promise<void> {
+  if (!sharedCollections) return;
+  const run = pushChain.then(async () => {
+    for (const c of sharedCollections!) await c.push();
+  });
+  pushChain = run.catch(() => {});
+  return run;
+}
+
+if (isSharedStoreEnabled()) {
+  initSharedCollections();
+  console.log("[store] Shared Firestore persistence enabled.");
+}
+
+// Vite integration
+async function startServer() {
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`IB DP Computer Science auto-grader server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

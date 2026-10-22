@@ -1,0 +1,10 @@
+{
+  "name": "IB DP Computer Science AutoGrader",
+  "description": "Auto-marking assessment, Learning Hub and IA tracker for IB Diploma Programme Computer Science (SL and HL, first assessment 2027): Paper 1, Paper 2 (Python) and the internal assessment.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
