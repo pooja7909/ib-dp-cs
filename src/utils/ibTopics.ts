@@ -1,6 +1,6 @@
 // IB DP Computer Science topic catalogue used by the server (AI prompts, topic detection)
 // and the client (filters, unit pickers). Built from src/data/ibSyllabus.ts.
-import { IB_TOPICS, IB_TOPIC_MAP, type IBTopic } from "../data/ibSyllabus";
+import { IB_TOPICS, IB_TOPIC_MAP, type IBTopic } from "../data/ibSyllabus.js";
 
 export interface IBUnitInfo {
   code: string; // "A1" ... "B4", "CS"

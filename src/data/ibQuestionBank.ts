@@ -1,7 +1,7 @@
 import type { IGCSETask, IGCSEUnit } from "../types";
-import { IB_TOPICS } from "./ibSyllabus";
-import { IB_PAPER1_TASKS } from "./ibBankPaper1";
-import { IB_PAPER2_TASKS } from "./ibBankPaper2";
+import { IB_TOPICS } from "./ibSyllabus.js";
+import { IB_PAPER1_TASKS } from "./ibBankPaper1.js";
+import { IB_PAPER2_TASKS } from "./ibBankPaper2.js";
 
 /** Every built-in IB question, grouped into one unit per IB topic (A1-A4, B1-B4, CS). */
 export function getIBUnits(): IGCSEUnit[] {
