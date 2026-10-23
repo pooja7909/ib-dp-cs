@@ -733,6 +733,7 @@ export const QuestionUploader: React.FC<QuestionUploaderProps> = ({
         return;
       }
       if (onQuestionsBatchAdded) {
+        onQuestionsBatchAdded(questionsToSave);
       } else {
         questionsToSave.forEach((q) => onQuestionAdded(q));
       }
