@@ -3976,6 +3976,26 @@ app.post("/api/teacher/login", async (req, res) => {
     } catch (e) {}
   }
 
+  // The master passcode set in Vercel (TEACHER_PASSCODE) always opens the head of department's
+  // account - even after the account's own passcode was changed or forgotten.
+  const master = String(process.env.TEACHER_PASSCODE || "");
+  if (master) {
+    const a = crypto.createHash("sha256").update(candidate.trim()).digest();
+    const b = crypto.createHash("sha256").update(master.trim()).digest();
+    if (crypto.timingSafeEqual(a, b)) {
+      const head =
+        teachersDb["t_primary"] ||
+        Object.values(teachersDb).find((t: any) => t && t.role === "head_of_dept") ||
+        Object.values(teachersDb)[0];
+      if (head) {
+        const token = issueTeacherToken(head.id);
+        const { salt: _s, hash: _h, ...profile } = head as any;
+        res.json({ success: true, token, teacher: profile });
+        return;
+      }
+    }
+  }
+
   res.status(401).json({ error: "Invalid teacher passcode or credentials. Access denied." });
 });
 
