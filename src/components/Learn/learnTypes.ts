@@ -35,7 +35,9 @@ export type LearnStep =
   | { kind: "bits"; title: string; intro: string; mode: "unsigned" | "twos" | "signmag"; bits: number; target: number | null; showHex?: boolean }
   | { kind: "gates"; title: string; intro: string; gate: "AND" | "OR" | "NOT" | "EXPR1" }
   | { kind: "stepper"; title: string; intro: string; frames: StepperFrame[] }
-  | { kind: "calc"; title: string; intro: string; calc: "image" | "sound" };
+  | { kind: "calc"; title: string; intro: string; calc: "image" | "sound" }
+  // A free SQL playground (real SQLite in the browser) inside the learning steps
+  | { kind: "sqltry"; title: string; intro: string; setup: string; starter?: string };
 
 export interface StepperFrame {
   caption: string;
@@ -82,6 +84,22 @@ export type PracticeItem = (
   | { kind: "answer"; id: string; title: string; prompt: string; accept: string[]; hints: string[]; solution: string }
   | { kind: "classify"; id: string; title?: string; prompt: string; columns: string[]; rowHeader?: string; rows: { text: string; answer: number }[]; explain?: string; hints: string[] }
   | { kind: "written"; id: string; title?: string; prompt: string; marks: number; points: string[]; guide?: string; model?: string; hints: string[] }
+  | {
+      // Write an SQL query/statement in the playground; checked by comparing result sets with the model's
+      kind: "sql";
+      id: string;
+      title?: string;
+      prompt: string;
+      setup: string; // CREATE TABLE + INSERT script for a fresh database
+      solution: string; // model SQL
+      expected: { columns: string[]; rows: (string | number | null)[][] }; // model result (or the checked table's rows after DML)
+      ordered?: boolean; // the model query has ORDER BY, so row order matters
+      checkTable?: string; // INSERT/UPDATE/DELETE: compare this table's contents afterwards
+      require?: string[]; // keywords the answer must use, e.g. ["JOIN"]
+      starter?: string;
+      explain?: string;
+      hints: string[];
+    }
 ) & { level?: PracticeLevel; topic?: string };
 
 export interface QuizQuestion {

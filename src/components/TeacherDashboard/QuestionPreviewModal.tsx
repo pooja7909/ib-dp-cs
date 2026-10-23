@@ -2,6 +2,7 @@ import React from "react";
 import { BriefText } from "../BriefText";
 import { IGCSETask, getTaskDifficulty } from "../../types";
 import { PythonSnippetViewer } from "../PythonSnippetViewer";
+import { SqlPlayground } from "../Sql/SqlPlayground";
 import { looksLikeCodingTask, convertToCodeTask } from "../../utils/codingTask";
 import {
   X,
@@ -192,6 +193,17 @@ export const QuestionPreviewModal: React.FC<QuestionPreviewModalProps> = ({
               className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-sm leading-relaxed text-slate-900 font-normal"
             />
           </div>
+
+          {/* SQL questions: what students see next to their answer (tables + "try your query") */}
+          {task.sqlSetup && (
+            <SqlPlayground
+              key={task.id}
+              setup={task.sqlSetup}
+              title="SQL playground (students see this next to their answer)"
+              collapsibleTables
+              initialQuery={task.solution && !task.parts ? task.solution : ""}
+            />
+          )}
 
           {/* Written question that is really a coding task: offer to convert it */}
           {task.type === "theory" && onUpdateQuestion && (

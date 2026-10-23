@@ -21,6 +21,8 @@ interface Base {
   diff: QuestionDifficulty;
   title: string;
   hint?: string;
+  /** SQL questions: setup script for the student's SQL playground (tables shown + "try your query") */
+  sqlSetup?: string;
 }
 
 interface Bands {
@@ -59,6 +61,7 @@ function shell(o: Base, type: IGCSETask["type"], marks: number, brief: string, i
     specReference: o.spec,
     commandWord: o.cmd,
     ibLevel: o.hl ? "HL" : "SL",
+    ...(o.sqlSetup ? { sqlSetup: o.sqlSetup } : {}),
   };
 }
 
@@ -296,6 +299,224 @@ P3        | Glue     | Craft      | 2.00  | 15
 P4        | Paint    | Craft      | 3.50  | 8
 P5        | Notebook | Stationery | 2.50  | 60
 ${B}`;
+
+// ---------------------------------------------------------------------------
+// SQL playground data for the "Construct an SQL query/statement" questions: the same tables as the question
+// describes, with sample rows, so students can test their query before writing the final answer.
+// (Model answers are checked against these by running them in SQLite.)
+// ---------------------------------------------------------------------------
+const LIBRARY_SQL = `CREATE TABLE STUDENT (
+  StudentID VARCHAR(5) PRIMARY KEY,
+  FirstName VARCHAR(20),
+  LastName VARCHAR(20),
+  Form VARCHAR(3)
+);
+INSERT INTO STUDENT VALUES
+  ('S101', 'Aisha', 'McAllister', '10A'),
+  ('S102', 'Ben', 'Murphy', '10A'),
+  ('S103', 'Chen', 'McKenzie', '10B'),
+  ('S104', 'Dara', 'McBride', '10C'),
+  ('S105', 'Eli', 'Okafor', '10B'),
+  ('S106', 'Fern', 'MacLeod', '10A'),
+  ('S107', 'Gus', 'McCoy', '10B');
+CREATE TABLE BOOK (
+  BookID VARCHAR(3) PRIMARY KEY,
+  Title VARCHAR(40),
+  Author VARCHAR(30),
+  Genre VARCHAR(15),
+  PubYear INTEGER
+);
+INSERT INTO BOOK VALUES
+  ('B01', 'The Silent Coast', 'Okafor', 'Fiction', 2015),
+  ('B02', 'Atoms and Stars', 'Lindqvist', 'Science', 2019),
+  ('B03', 'River of Glass', 'Okafor', 'Fiction', 2021),
+  ('B04', 'Code and Craft', 'Mehta', 'Science', 2012),
+  ('B05', 'Salt Roads', 'Duarte', 'History', 2019),
+  ('B06', 'Small Machines', 'Mehta', 'Science', 2023);
+CREATE TABLE LOAN (
+  LoanID INTEGER PRIMARY KEY,
+  StudentID VARCHAR(5) REFERENCES STUDENT(StudentID),
+  BookID VARCHAR(3) REFERENCES BOOK(BookID),
+  LoanDate DATE,
+  ReturnDate DATE
+);
+INSERT INTO LOAN VALUES
+  (1, 'S101', 'B02', '2026-09-02', '2026-09-16'),
+  (2, 'S103', 'B05', '2026-09-08', NULL),
+  (3, 'S102', 'B01', '2026-09-10', '2026-09-24'),
+  (4, 'S105', 'B06', '2026-09-15', NULL),
+  (5, 'S101', 'B04', '2026-09-21', NULL),
+  (6, 'S107', 'B02', '2026-09-30', '2026-10-07'),
+  (7, 'S104', 'B03', '2026-10-01', NULL);
+`;
+
+const CRAFT_SHOP_SQL = `CREATE TABLE CUSTOMER (
+  CustomerID VARCHAR(4) PRIMARY KEY,
+  Name VARCHAR(30),
+  Email VARCHAR(40),
+  Town VARCHAR(20)
+);
+INSERT INTO CUSTOMER VALUES
+  ('C01', 'Hannah Price', 'hprice@example.com', 'Leeds'),
+  ('C02', 'Imran Shah', 'ishah@example.com', 'York'),
+  ('C03', 'Jade Wong', 'jwong@example.com', 'Leeds'),
+  ('C04', 'Karl Evans', 'kevans@example.com', 'Leeds'),
+  ('C05', 'Lena Novak', 'lnovak@example.com', 'Bradford');
+CREATE TABLE ORDERS (
+  OrderID INTEGER PRIMARY KEY,
+  CustomerID VARCHAR(4) REFERENCES CUSTOMER(CustomerID),
+  OrderDate DATE,
+  Total REAL
+);
+INSERT INTO ORDERS VALUES
+  (501, 'C01', '2026-09-01', 24.50),
+  (502, 'C02', '2026-09-03', 35.00),
+  (503, 'C03', '2026-09-05', 12.75),
+  (504, 'C01', '2026-09-12', 50.00),
+  (505, 'C04', '2026-09-14', 61.20),
+  (506, 'C03', '2026-09-20', 20.00),
+  (507, 'C05', '2026-09-22', 44.10),
+  (508, 'C04', '2026-10-02', 18.90);
+`;
+
+const PRODUCT_SQL = `CREATE TABLE PRODUCT (
+  ProductID VARCHAR(3) PRIMARY KEY,
+  Name VARCHAR(20),
+  Category VARCHAR(15),
+  Price REAL,
+  Stock INTEGER
+);
+INSERT INTO PRODUCT VALUES
+  ('P1', 'Pencil', 'Stationery', 0.50, 120),
+  ('P2', 'Ruler', 'Stationery', 1.20, 40),
+  ('P3', 'Glue', 'Craft', 2.00, 15),
+  ('P4', 'Paint', 'Craft', 3.50, 8),
+  ('P5', 'Notebook', 'Stationery', 2.50, 60);
+`;
+
+const BOOKING_SQL = `CREATE TABLE BOOKING (
+  BookingRef VARCHAR(6) PRIMARY KEY,
+  PassengerSurname VARCHAR(30),
+  FlightNumber VARCHAR(6),
+  SeatNo VARCHAR(4)
+);
+INSERT INTO BOOKING VALUES
+  ('BK201', 'Moreau', 'IB102', '12A'),
+  ('BK202', 'Tanaka', 'IB102', '12B'),
+  ('BK203', 'Osei', 'IB110', '3C'),
+  ('BK204', 'Lindgren', 'IB114', '22F'),
+  ('BK205', 'Costa', 'IB118', '7D');
+`;
+
+const RESULTS_SQL = `CREATE TABLE STUDENT (
+  StudentID VARCHAR(5) PRIMARY KEY,
+  Name VARCHAR(30),
+  Form VARCHAR(3)
+);
+INSERT INTO STUDENT VALUES
+  ('S201', 'Amira Haddad', '11A'),
+  ('S202', 'Bruno Silva', '11A'),
+  ('S203', 'Cara Doyle', '11B'),
+  ('S204', 'Dev Patel', '11B'),
+  ('S205', 'Eva Kowalski', '11C'),
+  ('S206', 'Femi Adeyemi', '11C');
+CREATE TABLE RESULT (
+  StudentID VARCHAR(5) REFERENCES STUDENT(StudentID),
+  Subject VARCHAR(20),
+  Mark INTEGER,
+  PRIMARY KEY (StudentID, Subject)
+);
+INSERT INTO RESULT VALUES
+  ('S201', 'Mathematics', 72),
+  ('S201', 'Physics', 65),
+  ('S202', 'Mathematics', 58),
+  ('S202', 'Physics', 70),
+  ('S203', 'Mathematics', 81),
+  ('S203', 'Physics', 49),
+  ('S204', 'Mathematics', 77),
+  ('S205', 'Mathematics', 44),
+  ('S205', 'Physics', 62),
+  ('S206', 'Mathematics', 59);
+`;
+
+const ACCOUNT_SQL = `CREATE TABLE ACCOUNT (
+  AccountNo INTEGER PRIMARY KEY,
+  Holder VARCHAR(30),
+  Balance REAL
+);
+INSERT INTO ACCOUNT VALUES
+  (1001, 'R. Mensah', 900.00),
+  (2002, 'T. Ivanova', 120.00),
+  (3003, 'J. Romero', 45.50);
+`;
+
+const FILM_ONLY_SQL = `CREATE TABLE FILM (
+  FilmID VARCHAR(4) PRIMARY KEY,
+  Title VARCHAR(40),
+  Certificate VARCHAR(3),
+  Minutes INTEGER
+);
+INSERT INTO FILM VALUES
+  ('F01', 'Harbour Lights', 'PG', 104),
+  ('F02', 'The Long Signal', '15', 131),
+  ('F03', 'Paper Planets', 'U', 89);
+`;
+
+const CINEMA_BANK_SQL = FILM_ONLY_SQL + `CREATE TABLE SCREENING (
+  ScreeningID INTEGER PRIMARY KEY,
+  FilmID VARCHAR(4) REFERENCES FILM(FilmID),
+  ScreenNo INTEGER,
+  ShowDate DATE,
+  TicketsSold INTEGER
+);
+INSERT INTO SCREENING VALUES
+  (1, 'F01', 1, '2026-10-02', 64),
+  (2, 'F02', 2, '2026-10-02', 88),
+  (3, 'F03', 3, '2026-10-03', 120),
+  (4, 'F01', 1, '2026-10-03', 41),
+  (5, 'F02', 2, '2026-10-03', 97),
+  (6, 'F03', 1, '2026-10-04', 75),
+  (7, 'F02', 3, '2026-10-04', 52),
+  (8, 'F03', 2, '2026-10-05', 33);
+`;
+
+const HOSPITAL_BANK_SQL = `CREATE TABLE WARD (
+  WardID VARCHAR(3) PRIMARY KEY,
+  WardName VARCHAR(20),
+  Beds INTEGER
+);
+INSERT INTO WARD VALUES
+  ('W1', 'Rowan', 20),
+  ('W2', 'Birch', 16),
+  ('W3', 'Cedar', 24),
+  ('W4', 'Maple', 12);
+CREATE TABLE PATIENT (
+  PatientID VARCHAR(5) PRIMARY KEY,
+  Name VARCHAR(30),
+  Age INTEGER,
+  WardID VARCHAR(3) REFERENCES WARD(WardID),
+  AdmittedOn DATE
+);
+INSERT INTO PATIENT VALUES
+  ('P101', 'Omar Said', 67, 'W3', '2026-10-01'),
+  ('P102', 'Lucy Grant', 8, 'W1', '2026-10-03'),
+  ('P103', 'Ana Silva', 45, 'W3', '2026-10-04'),
+  ('P104', 'Jonas Berg', 81, 'W4', '2026-09-28'),
+  ('P105', 'Priya Nair', 12, 'W1', '2026-10-05'),
+  ('P106', 'Hugo Laurent', 73, 'W4', '2026-10-06');
+`;
+
+const ORDER_SQL = PRODUCT_SQL + `CREATE TABLE ORDERLINE (
+  OrderID INTEGER,
+  ProductID VARCHAR(3) REFERENCES PRODUCT(ProductID),
+  Quantity INTEGER,
+  PRIMARY KEY (OrderID, ProductID)
+);
+INSERT INTO ORDERLINE VALUES
+  (901, 'P1', 10),
+  (901, 'P5', 2),
+  (902, 'P4', 3);
+`;
 
 // ---------------------------------------------------------------------------
 // A3 Databases
@@ -702,6 +923,7 @@ const A3: IGCSETask[] = [
   }),
   theory({
     unit: "A3", spec: "A3.3.2", cmd: "Construct", diff: "Easy", title: "A3.3 SQL: filter and sort",
+    sqlSetup: LIBRARY_SQL,
     brief: `${LIBRARY_SCHEMA}\n\nConstruct an SQL query to list the Title and PubYear of every book written by Mehta, newest first. [3]`,
     marks: 3,
     kw: ["SELECT", "WHERE", "ORDER BY", "DESC"],
@@ -715,6 +937,7 @@ const A3: IGCSETask[] = [
   }),
   theory({
     unit: "A3", spec: "A3.3.2", cmd: "Construct", diff: "Moderate", title: "A3.3 SQL: join two tables",
+    sqlSetup: LIBRARY_SQL,
     brief: `${LIBRARY_SCHEMA}\n\nConstruct an SQL query to list the LoanDate and the Title of every book that is currently on loan (not yet returned), in order of LoanDate (oldest first). [4]`,
     marks: 4,
     kw: ["JOIN", "ON", "IS NULL", "ORDER BY"],
@@ -730,6 +953,7 @@ const A3: IGCSETask[] = [
   }),
   theory({
     unit: "A3", spec: "A3.3.2", cmd: "Construct", diff: "Moderate", title: "A3.3 SQL: LIKE and BETWEEN",
+    sqlSetup: LIBRARY_SQL,
     brief: `${LIBRARY_SCHEMA}\n\nConstruct an SQL query to list the FirstName and LastName of each student whose LastName begins with 'Mc' and who is in form 10A or 10B, in alphabetical order of LastName. [4]`,
     marks: 4,
     kw: ["LIKE", "%", "OR", "ORDER BY"],
@@ -745,6 +969,7 @@ const A3: IGCSETask[] = [
   }),
   structured({
     unit: "A3", spec: "A3.3.2", cmd: "Construct", diff: "Hard", title: "A3.3 Querying a craft shop",
+    sqlSetup: CRAFT_SHOP_SQL,
     stem: `${SHOP_SCHEMA}`,
     parts: [
       {
@@ -784,7 +1009,8 @@ const A3: IGCSETask[] = [
   }),
   structured({
     unit: "A3", spec: "A3.3.3", cmd: "Construct", diff: "Moderate", title: "A3.3 Updating the product table",
-    stem: `${PRODUCT_DATA}`,
+    sqlSetup: PRODUCT_SQL,
+    stem: `A craft shop stores its stock in one table, PRODUCT (ProductID is the primary key). The table currently contains:\n\n${PRODUCT_DATA}`,
     parts: [
       {
         q: "Construct an SQL statement to add a new product P6, 'Scissors', in the Craft category, priced 4.25 with 30 in stock.", marks: 2,
@@ -806,7 +1032,8 @@ const A3: IGCSETask[] = [
   }),
   structured({
     unit: "A3", spec: "A3.3.3", cmd: "Explain", diff: "Hard", title: "A3.3 Updates and indexes",
-    stem: "An airline stores BOOKING (BookingRef, PassengerSurname, FlightNumber, SeatNo). The table has indexes on PassengerSurname and FlightNumber. Each night, about 200 000 rows are updated when flights are rescheduled.",
+    sqlSetup: BOOKING_SQL,
+    stem: "An airline stores bookings in the table BOOKING (BookingRef, PassengerSurname, FlightNumber, SeatNo), with BookingRef as the primary key. The table has indexes on PassengerSurname and FlightNumber. Each night, about 200 000 rows are updated when flights are rescheduled.",
     parts: [
       { q: "Construct an SQL statement to change the flight number of booking 'BK204' to 'IB118'.", marks: 2, pts: ["UPDATE BOOKING SET FlightNumber = 'IB118'", "WHERE BookingRef = 'BK204'"], example: "UPDATE BOOKING\nSET FlightNumber = 'IB118'\nWHERE BookingRef = 'BK204';" },
       {
@@ -845,7 +1072,8 @@ const A3: IGCSETask[] = [
   }),
   structured({
     unit: "A3", spec: "A3.3.4", hl: true, cmd: "Construct", diff: "Hard", title: "A3.3 SQL: grouped averages",
-    stem: "A school stores RESULT (StudentID, Subject, Mark) and STUDENT (StudentID, Name, Form).",
+    sqlSetup: RESULTS_SQL,
+    stem: "A school stores two tables:\n\nSTUDENT (StudentID, Name, Form) - primary key StudentID\nRESULT (StudentID, Subject, Mark) - primary key (StudentID, Subject); RESULT.StudentID is a foreign key referencing STUDENT.",
     parts: [
       { q: "Outline the difference between the WHERE and HAVING clauses.", marks: 2, pts: ["WHERE filters individual rows before grouping", "HAVING filters groups after GROUP BY, so it can use aggregate functions such as AVG"] },
       {
@@ -920,7 +1148,8 @@ const A3: IGCSETask[] = [
   }),
   structured({
     unit: "A3", spec: "A3.3.6", hl: true, cmd: "Construct", diff: "Hard", title: "A3.3 Transferring money safely",
-    stem: "A bank stores ACCOUNT (AccountNo, Holder, Balance). A customer transfers 250 from account 1001 to account 2002.",
+    sqlSetup: ACCOUNT_SQL,
+    stem: "A bank stores accounts in the table ACCOUNT (AccountNo, Holder, Balance), with AccountNo as the primary key. A customer transfers 250 from account 1001 to account 2002.",
     parts: [
       {
         q: "Construct the SQL transaction for this transfer, using transaction control language (TCL) commands.", marks: 4,
@@ -1057,6 +1286,147 @@ const A3: IGCSETask[] = [
         "Conclusion: the network is a major but not the only factor; design choices can reduce its impact",
       ],
     },
+  }),
+  // ----- extra A3.3 coverage (appended so that existing question ids stay the same) -----
+  structured({
+    unit: "A3", spec: "A3.3.1", cmd: "Construct", diff: "Hard", title: "A3.3 Defining a table with DDL",
+    sqlSetup: FILM_ONLY_SQL,
+    stem: "A cinema's database already contains the table FILM (FilmID, Title, Certificate, Minutes), with FilmID as the primary key. A second table is needed to store each screening of a film.",
+    parts: [
+      {
+        q: "Construct an SQL statement to create the table SCREENING with the fields ScreeningID (an integer primary key), FilmID (a foreign key referencing FILM), ScreenNo (an integer) and ShowDate (a date).", marks: 4,
+        kw: ["CREATE TABLE", "PRIMARY KEY", "REFERENCES", "data types"],
+        pts: [
+          "CREATE TABLE SCREENING ( ... )",
+          "ScreeningID INTEGER PRIMARY KEY",
+          "FilmID with a suitable data type and REFERENCES FILM(FilmID) / FOREIGN KEY (FilmID) REFERENCES FILM(FilmID)",
+          "ScreenNo INTEGER and ShowDate DATE (suitable data types for every field)",
+        ],
+        example: "CREATE TABLE SCREENING (\n  ScreeningID INTEGER PRIMARY KEY,\n  FilmID VARCHAR(4) REFERENCES FILM(FilmID),\n  ScreenNo INTEGER,\n  ShowDate DATE\n);",
+        accept: ["a separate FOREIGN KEY (FilmID) REFERENCES FILM(FilmID) clause.", "CHAR/VARCHAR/TEXT for FilmID."],
+      },
+      {
+        q: "The cinema later wants to record the number of tickets sold for each screening. Construct an SQL statement to add the field TicketsSold to SCREENING.", marks: 2,
+        pts: ["ALTER TABLE SCREENING", "ADD TicketsSold INTEGER (or ADD COLUMN)"],
+        example: "ALTER TABLE SCREENING ADD TicketsSold INTEGER;",
+      },
+      {
+        q: "State whether each of the statements in (a) and (b), and the statement SELECT Title FROM FILM; belongs to DDL or DML. Justify your answer for the SELECT statement.", marks: 2,
+        pts: ["(a) and (b) are DDL (they define/change the structure)", "SELECT is DML, because it retrieves data from the tables rather than changing their structure"],
+      },
+    ],
+  }),
+  theory({
+    unit: "A3", spec: "A3.3.1", cmd: "Explain", diff: "Moderate", title: "A3.3 DROP TABLE or DELETE?",
+    brief: "A technician wants to remove all the records of last year's clubs from the table CLUB but keep the table for next year. They are deciding between the statements DROP TABLE CLUB; and DELETE FROM CLUB;\n\nExplain which statement should be used, referring to the SQL data language types. [3]",
+    marks: 3,
+    kw: ["DDL", "DML", "structure", "data", "DELETE", "DROP"],
+    pts: [
+      "DROP TABLE is DDL: it removes the table structure itself (and all its data)",
+      "DELETE FROM is DML: it removes records but the table definition (fields, keys) remains",
+      "So DELETE FROM CLUB should be used, because the table is needed again next year",
+    ],
+  }),
+  structured({
+    unit: "A3", spec: "A3.3.3", cmd: "Construct", diff: "Hard", title: "A3.3 Keeping hospital records up to date",
+    sqlSetup: HOSPITAL_BANK_SQL,
+    stem: "A hospital stores two tables:\n\nWARD (WardID, WardName, Beds) - primary key WardID\nPATIENT (PatientID, Name, Age, WardID, AdmittedOn) - primary key PatientID; PATIENT.WardID is a foreign key referencing WARD.",
+    parts: [
+      {
+        q: "Construct an SQL statement to add a new patient: P107, Mara Costa, aged 29, admitted to ward W2 on 2026-10-07.", marks: 2,
+        pts: ["INSERT INTO PATIENT (field list optional)", "VALUES ('P107', 'Mara Costa', 29, 'W2', '2026-10-07') in the correct order with text/dates in quotes"],
+        example: "INSERT INTO PATIENT (PatientID, Name, Age, WardID, AdmittedOn)\nVALUES ('P107', 'Mara Costa', 29, 'W2', '2026-10-07');",
+      },
+      {
+        q: "Ward W4 is closing. Construct an SQL statement to move every patient on ward W4 to ward W3.", marks: 2,
+        pts: ["UPDATE PATIENT SET WardID = 'W3'", "WHERE WardID = 'W4'"],
+        example: "UPDATE PATIENT\nSET WardID = 'W3'\nWHERE WardID = 'W4';",
+      },
+      {
+        q: "Construct an SQL statement to remove the records of patients aged over 60 who were admitted before 2026-10-01.", marks: 2,
+        pts: ["DELETE FROM PATIENT", "WHERE Age > 60 AND AdmittedOn < '2026-10-01'"],
+        example: "DELETE FROM PATIENT\nWHERE Age > 60 AND AdmittedOn < '2026-10-01';",
+      },
+      {
+        q: "Explain why the DBMS would reject an attempt to delete ward W1 from WARD while patients are still assigned to it.", marks: 2,
+        pts: ["PATIENT.WardID is a foreign key referring to W1", "deleting W1 would leave patients referring to a ward that does not exist, breaking referential integrity, so the DBMS refuses"],
+      },
+    ],
+  }),
+  theory({
+    unit: "A3", spec: "A3.3.4", hl: true, cmd: "Construct", diff: "Moderate", title: "A3.3 SQL: cinema attendance report",
+    sqlSetup: CINEMA_BANK_SQL,
+    brief: "A cinema stores two tables:\n\nFILM (FilmID, Title, Certificate, Minutes) - primary key FilmID\nSCREENING (ScreeningID, FilmID, ScreenNo, ShowDate, TicketsSold) - primary key ScreeningID; SCREENING.FilmID is a foreign key referencing FILM.\n\nConstruct an SQL query that shows the Title of each film with the total number of tickets sold and the highest number sold at a single screening, for films with a total of more than 150 tickets. [5]",
+    marks: 5,
+    kw: ["SUM", "MAX", "GROUP BY", "HAVING", "JOIN"],
+    pts: [
+      "SELECT FILM.Title, SUM(SCREENING.TicketsSold), MAX(SCREENING.TicketsSold)",
+      "FROM FILM JOIN SCREENING",
+      "ON FILM.FilmID = SCREENING.FilmID",
+      "GROUP BY FILM.Title (or FILM.FilmID)",
+      "HAVING SUM(SCREENING.TicketsSold) > 150",
+    ],
+    example: "SELECT FILM.Title, SUM(SCREENING.TicketsSold) AS Total, MAX(SCREENING.TicketsSold) AS Best\nFROM FILM\nJOIN SCREENING ON FILM.FilmID = SCREENING.FilmID\nGROUP BY FILM.Title\nHAVING SUM(SCREENING.TicketsSold) > 150;",
+    reject: ["the condition on the total placed in WHERE."],
+  }),
+  theory({
+    unit: "A3", spec: "A3.3.5", hl: true, cmd: "Construct", diff: "Moderate", title: "A3.3 Creating and using a view",
+    sqlSetup: PRODUCT_SQL,
+    brief: "A craft shop stores PRODUCT (ProductID, Name, Category, Price, Stock), with ProductID as the primary key. Staff who reorder stock only need the name and stock level of products with fewer than 20 items in stock.\n\nConstruct SQL statements to create a view called LOWSTOCK for these staff, and then to list the contents of the view in order of Stock (lowest first). [4]",
+    marks: 4,
+    kw: ["CREATE VIEW", "AS SELECT", "WHERE", "ORDER BY"],
+    pts: [
+      "CREATE VIEW LOWSTOCK AS",
+      "SELECT Name, Stock FROM PRODUCT",
+      "WHERE Stock < 20",
+      "SELECT * FROM LOWSTOCK ORDER BY Stock (ASC)",
+    ],
+    example: "CREATE VIEW LOWSTOCK AS\nSELECT Name, Stock\nFROM PRODUCT\nWHERE Stock < 20;\n\nSELECT * FROM LOWSTOCK ORDER BY Stock ASC;",
+  }),
+  mcq({
+    unit: "A3", spec: "A3.3.5", hl: true, cmd: "Identify", diff: "Easy", title: "A3.3 Database views",
+    brief: "Choose the correct answer for each question about database views.",
+    qs: [
+      { q: "What does a virtual view store?", o: ["A copy of the result rows", "Only the query that defines it", "An index on every column", "A backup of the base tables"], a: 1 },
+      { q: "Which is the main disadvantage of a materialised view?", o: ["It cannot be queried with SELECT", "Its data can be out of date until it is refreshed", "It always runs the query again", "It cannot include a join"], a: 1 },
+      { q: "A view that shows staff names but not salaries mainly provides:", o: ["security", "durability", "normalisation", "atomicity"], a: 0 },
+      { q: "Which view is most likely to be read-only?", o: ["SELECT Name, Email FROM CUSTOMER WHERE Town = 'Leeds'", "SELECT Town, COUNT(*) FROM CUSTOMER GROUP BY Town", "SELECT CustomerID, Name FROM CUSTOMER", "SELECT * FROM CUSTOMER"], a: 1, why: "views with aggregates/GROUP BY cannot map changes back to single base rows" },
+    ],
+  }),
+  structured({
+    unit: "A3", spec: "A3.3.6", hl: true, cmd: "Construct", diff: "Hard", title: "A3.3 Recording an order in a transaction",
+    sqlSetup: ORDER_SQL,
+    stem: "A craft shop stores PRODUCT (ProductID, Name, Category, Price, Stock) and ORDERLINE (OrderID, ProductID, Quantity), where ORDERLINE.ProductID is a foreign key referencing PRODUCT. When a customer orders 5 tubes of Glue (P3) in order 903, a line is added to ORDERLINE and the stock of P3 is reduced by 5.",
+    parts: [
+      {
+        q: "Construct the SQL transaction that records this order.", marks: 4,
+        pts: [
+          "BEGIN TRANSACTION",
+          "INSERT INTO ORDERLINE VALUES (903, 'P3', 5)",
+          "UPDATE PRODUCT SET Stock = Stock - 5 WHERE ProductID = 'P3'",
+          "COMMIT (at the end, after both statements)",
+        ],
+        example: "BEGIN TRANSACTION;\nINSERT INTO ORDERLINE (OrderID, ProductID, Quantity) VALUES (903, 'P3', 5);\nUPDATE PRODUCT SET Stock = Stock - 5 WHERE ProductID = 'P3';\nCOMMIT;",
+      },
+      {
+        q: "Describe when ROLLBACK would be used in this transaction and its effect.", marks: 2,
+        pts: ["If a step fails or a check fails, e.g. the stock would become negative / the insert is rejected", "ROLLBACK undoes every change since BEGIN TRANSACTION, so the order line and stock change are both cancelled (atomicity)"],
+      },
+      {
+        q: "Explain how the consistency property of ACID applies to this transaction.", marks: 2,
+        pts: ["The database must move from one valid state to another, obeying all rules/constraints", "e.g. stock never negative and every order line refers to an existing product; the stock reduction always matches the quantity ordered"],
+      },
+    ],
+  }),
+  mcq({
+    unit: "A3", spec: "A3.3.6", hl: true, cmd: "Identify", diff: "Easy", title: "A3.3 Transactions and TCL",
+    brief: "Choose the correct answer for each question about transactions.",
+    qs: [
+      { q: "Which command makes the changes in a transaction permanent?", o: ["ROLLBACK", "COMMIT", "BEGIN TRANSACTION", "SAVE TABLE"], a: 1 },
+      { q: "A transfer debits one account, then the server crashes before the credit. Which property ensures the debit is undone?", o: ["Durability", "Isolation", "Atomicity", "Consistency"], a: 2 },
+      { q: "Two users book the last seat at the same moment, but only one succeeds. Which property is shown?", o: ["Isolation", "Atomicity", "Durability", "Normalisation"], a: 0 },
+      { q: "Which statement about ROLLBACK is true?", o: ["It deletes the table", "It undoes all changes made since BEGIN TRANSACTION", "It only undoes the last statement after COMMIT", "It saves a backup copy"], a: 1 },
+    ],
   }),
 ];
 

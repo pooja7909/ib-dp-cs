@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ChevronLeft, ChevronRight, Lightbulb, Lock, CheckCircle2, XCircle, Play, Trophy, BookOpen, Wrench, Star } from "lucide-react";
 import type { LearnLesson, LearnStep, LessonProgress, PracticeItem, QuizQuestion } from "./learnTypes";
 import { STAMP_INFO, practiceTargetCount, quizLength } from "./learnTypes";
-import { McqPractice, OutputPractice, TracePractice, OrderPractice, LEVEL_LABEL, ClassifyPractice, WrittenPractice } from "./PracticeKinds";
+import { McqPractice, OutputPractice, TracePractice, OrderPractice, LEVEL_LABEL, ClassifyPractice, WrittenPractice, SqlPractice } from "./PracticeKinds";
+import { SqlPlayground } from "../Sql/SqlPlayground";
 import { RichText, CodeBlock, CodeTracer, BitsWidget, GatesWidget, StepperWidget, CalcWidget } from "./LearnWidgets";
 import { Flowchart } from "./Flowchart";
 import { PythonCodeEditor } from "../PythonCodeEditor";
@@ -396,6 +397,7 @@ const KIND_LABEL: Record<string, string> = {
   answer: "Short answer",
   classify: "Complete the table",
   written: "Exam-style written answer",
+  sql: "Write the SQL",
 };
 
 const PracticeRunner: React.FC<{
@@ -484,6 +486,7 @@ const PracticeRunner: React.FC<{
         {cur.kind === "order" && <OrderPractice item={cur} solved={isSolved(cur.id)} preview={preview} onSolved={(n) => markSolved(cur.id, n)} />}
         {cur.kind === "classify" && <ClassifyPractice item={cur} solved={isSolved(cur.id)} preview={preview} onSolved={(n) => markSolved(cur.id, n)} />}
         {cur.kind === "written" && <WrittenPractice item={cur} solved={isSolved(cur.id)} preview={preview} onSolved={(n) => markSolved(cur.id, n)} />}
+        {cur.kind === "sql" && <SqlPractice item={cur} solved={isSolved(cur.id)} preview={preview} onSolved={(n) => markSolved(cur.id, n)} />}
         {(cur.kind === "code" || cur.kind === "answer") && (
           <PracticeCard item={cur} done={isSolved(cur.id)} preview={preview} onSolved={(n) => markSolved(cur.id, n)} />
         )}
@@ -743,6 +746,12 @@ export const LessonPlayer: React.FC<Props> = ({ lesson, progress, preview, allow
               <>
                 <p className="text-sm text-slate-700">{step.intro}</p>
                 <StepperWidget frames={step.frames} onFinished={() => markReady(idx)} />
+              </>
+            )}
+            {step.kind === "sqltry" && (
+              <>
+                <RichText text={step.intro} className="text-sm text-slate-700" />
+                <SqlPlayground setup={step.setup} initialQuery={step.starter || ""} title="Try it: SQL playground" />
               </>
             )}
             {step.kind === "calc" && (

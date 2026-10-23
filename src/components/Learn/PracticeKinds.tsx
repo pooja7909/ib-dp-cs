@@ -3,6 +3,8 @@ import { Lightbulb, CheckCircle2, XCircle, ArrowUp, ArrowDown } from "lucide-rea
 import type { PracticeItem } from "./learnTypes";
 import { RichText, CodeBlock, colourPython } from "./LearnWidgets";
 import { Flowchart } from "./Flowchart";
+import { SqlPlayground, ResultGrid, colourSql } from "../Sql/SqlPlayground";
+import { checkSql, type SqlCheckResult } from "../Sql/sqlEngine";
 
 type Kind<K extends PracticeItem["kind"]> = Extract<PracticeItem, { kind: K }>;
 
@@ -497,6 +499,88 @@ export const WrittenPractice: React.FC<KindProps<"written">> = ({ item, preview,
         </div>
       )}
       {solved && !shown && <div className="text-xs text-emerald-700 font-semibold">You have already answered this one.</div>}
+    </div>
+  );
+};
+
+// ---------------- Write SQL in a real playground; the result set is compared with the model's ----------------
+export const SqlPractice: React.FC<KindProps<"sql">> = ({ item, preview, onSolved, solved }) => {
+  const a = useAttempts(item.hints.length);
+  const [q, setQ] = useState(item.starter || "");
+  const [busy, setBusy] = useState(false);
+  const [fb, setFb] = useState<SqlCheckResult | null>(null);
+  const check = async () => {
+    setBusy(true);
+    try {
+      const res = await checkSql({ setup: item.setup, expected: item.expected, ordered: item.ordered, checkTable: item.checkTable, require: item.require }, q);
+      setFb(res);
+      if (res.ok) {
+        a.right();
+        onSolved(a.wrong + 1);
+      } else a.miss();
+    } catch (e: any) {
+      setFb({ ok: false, message: "The SQL engine could not run your answer: " + String(e?.message || e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  const expectedLabel = item.checkTable ? `Expected contents of ${item.checkTable} afterwards` : `Expected result (${item.expected.rows.length} row${item.expected.rows.length === 1 ? "" : "s"}${item.ordered ? ", in this order" : ", any order"})`;
+  return (
+    <div className="space-y-3">
+      <RichText text={item.prompt} className="text-[15px] font-semibold text-slate-900" />
+      <SqlPlayground
+        setup={item.setup}
+        query={q}
+        onQueryChange={(v) => {
+          setQ(v);
+          a.clearFlash();
+        }}
+        title="SQL playground - write and run your answer"
+        disabled={a.status !== "idle"}
+      />
+      <div className="text-xs text-slate-500">
+        {item.checkTable
+          ? `Check answer runs your SQL on a fresh copy of the tables and compares the ${item.checkTable} table afterwards with the expected one.`
+          : "Check answer runs your SQL on a fresh copy of the tables and compares your result with the expected result (column names do not matter, the values and the number of columns do)."}
+      </div>
+      {a.status === "idle" ? (
+        <div className="flex flex-wrap gap-2">
+          <button type="button" data-testid="pk-check" disabled={!q.trim() || busy} onClick={check} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold disabled:opacity-40">
+            {busy ? "Checking..." : "Check answer"}
+          </button>
+          {(a.wrong >= 2 || preview) && (
+            <button type="button" onClick={a.reveal} className="px-3 py-2 rounded-xl border border-slate-300 text-sm font-bold text-slate-600">
+              Show me the answer
+            </button>
+          )}
+        </div>
+      ) : null}
+      {fb && !fb.ok && a.status === "idle" && (
+        <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 space-y-2" data-testid="sql-check-wrong">
+          <div className="text-sm text-rose-900 font-semibold flex gap-2">
+            <XCircle className="w-4 h-4 mt-0.5 shrink-0" /> {fb.message}
+          </div>
+          <div>
+            <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 mb-1">{expectedLabel}</div>
+            <ResultGrid result={item.expected} maxHeight="14rem" />
+          </div>
+        </div>
+      )}
+      <Feedback
+        a={{ ...a, flash: false }}
+        hints={item.hints}
+        explain={item.explain}
+        solvedBefore={false}
+        answerText={
+          <div className="space-y-2">
+            <div className="text-xs font-bold">A model answer:</div>
+            <pre className="p-2 rounded-lg bg-white border border-slate-200 font-mono text-[13px] whitespace-pre-wrap" data-testid="sql-model">{colourSql(item.solution)}</pre>
+            <div className="text-xs font-bold">{expectedLabel}:</div>
+            <ResultGrid result={item.expected} maxHeight="14rem" />
+          </div>
+        }
+      />
+      {solved && a.status === "idle" && <div className="text-xs text-emerald-700 font-semibold">You have already solved this one.</div>}
     </div>
   );
 };

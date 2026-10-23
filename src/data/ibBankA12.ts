@@ -46,7 +46,7 @@ function base(s: Meta): IGCSETask {
     paper: "Paper 1",
     commandWord: s.cmd,
     examBoard: "IB",
-    source: { examBoard: "IB", qualification: "IB Diploma Programme Computer Science", paper: "Paper 1" },
+    source: { examBoard: "IB", qualification: "IB Diploma Programme Computer Science" },
   };
 }
 
@@ -1421,14 +1421,14 @@ const A2: IGCSETask[] = [
       ],
     }
   ),
-  inspect(
-    { u: "A2", ref: "A2.2.4", title: "A2.2 Subnetting calculations", d: "Hard", cmd: "Calculate" },
-    "A network administrator is subnetting the network 192.168.10.0/24. Remember that in each subnet two addresses (network and broadcast) cannot be given to hosts.",
+  mcq(
+    { u: "A2", ref: "A2.2.4", title: "A2.2 Subnetting concepts", d: "Easy", cmd: "Identify" },
+    "Answer each question about subnetting and its role in a network.",
     [
-      { q: "How many usable host addresses are there in the /24 network?", a: ["254"] },
-      { q: "The network is split into /26 subnets. How many subnets are created?", a: ["4"] },
-      { q: "How many usable host addresses are there in each /26 subnet?", a: ["62"] },
-      { q: "What is the subnet mask for a /26 network, in dotted decimal?", a: ["255.255.255.192"] },
+      { q: "What is subnetting?", o: ["Dividing one IP network into smaller logical networks", "Joining several networks into one large broadcast domain", "Encrypting the host part of an IP address", "Replacing private IP addresses with a public one"], a: 0 },
+      { q: "What does a subnet mask allow a device to determine?", o: ["The MAC address of the router", "Which part of an IP address identifies the network and which identifies the host", "Whether a website uses HTTPS", "The bandwidth of its connection"], a: 1 },
+      { q: "Traffic from one subnet to another must pass through which device?", o: ["A hub", "A repeater", "A router", "A wireless access point"], a: 2 },
+      { q: "How does subnetting reduce congestion?", o: ["It compresses every packet", "It increases the speed of the cables", "It removes the need for acknowledgements", "Broadcast traffic stays within each subnet"], a: 3 },
     ]
   ),
   multi(

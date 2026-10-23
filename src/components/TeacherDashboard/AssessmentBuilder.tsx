@@ -4,6 +4,7 @@ import { QuestionPreviewModal } from "./QuestionPreviewModal";
 import { briefSummary } from "../BriefText";
 import { buildQuestionUsage, matchesUsageFilter, usageStripeClass, UsageBadges, UsageLegend, UsageFilter } from "./QuestionUsage";
 import { SimilarQuestionModal } from "./SimilarQuestionModal";
+import { GuideTopicFilter, GuideFilterValue, matchesGuideFilter, StatementBadge } from "./GuideTopicFilter";
 import { ManualQuestionBuilder } from "./ManualQuestionBuilder";
 import { PythonSnippetViewer } from "../PythonSnippetViewer";
 import { teacherFetch } from "../../utils/teacherAuth";
@@ -114,6 +115,9 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
   const [ibLevel, setIbLevel] = useState<"SL" | "HL">(() => (editingAssessment?.ibLevel === "HL" ? "HL" : "SL"));
   const [levelFilter, setLevelFilter] = useState<"All" | "SL" | "HL">(() => (editingAssessment?.ibLevel === "SL" ? "SL" : "All"));
   const [difficultyFilter, setDifficultyFilter] = useState<string>("all");
+  // Guide-topic filter: topic = the IB unit chosen in "Topic / paper"; subtopic / statement narrow it
+  const [guideSub, setGuideSub] = useState<string>("");
+  const [guideStmt, setGuideStmt] = useState<string>("");
   const [sourceFilter, setSourceFilter] = useState<"all" | "teacher" | "past_papers" | "similar">("all");
   const [usageFilter, setUsageFilter] = useState<UsageFilter>("all");
   const [searchQuery, setSearchQuery] = useState<string>("");
@@ -584,7 +588,7 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
     [usageAssessments, allAssessments, editingAssessment?.id]
   );
 
-  const filteredUnits = units
+  const filteredUnitsBase = units
     .map((u) => ({
       ...u,
       tasks: u.tasks.filter((t) => {
@@ -638,6 +642,37 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
       }),
     }))
     .filter((u) => u.tasks.length > 0);
+
+  const guideTopic = isIBUnitCode(unitFilter) ? unitFilter : "";
+  const guideValue: GuideFilterValue = {
+    topic: guideTopic,
+    subtopic: guideTopic && guideSub.startsWith(guideTopic) ? guideSub : "",
+    statement: guideTopic && guideStmt.startsWith(guideTopic) ? guideStmt : "",
+  };
+  const handleGuideChange = (v: GuideFilterValue) => {
+    if (v.topic !== guideTopic) setUnitFilter(v.topic || "all");
+    setGuideSub(v.subtopic);
+    setGuideStmt(v.statement);
+  };
+  const filteredUnits =
+    guideValue.subtopic || guideValue.statement
+      ? filteredUnitsBase
+          .map((u) => ({ ...u, tasks: u.tasks.filter((t) => matchesGuideFilter(t, guideValue)) }))
+          .filter((u) => u.tasks.length > 0)
+      : filteredUnitsBase;
+  // Counts for the guide filter: paper, level and difficulty filters apply; topic does not
+  const guideCountTasks = useMemo(
+    () =>
+      units.flatMap((u) =>
+        u.tasks.filter(
+          (t) =>
+            (paperFilter === "all" || getTaskPaper(t, u.paper) === paperFilter) &&
+            matchesIBLevel(t, levelFilter) &&
+            (difficultyFilter === "all" || getTaskDifficulty(t) === difficultyFilter)
+        )
+      ),
+    [units, paperFilter, levelFilter, difficultyFilter]
+  );
 
   const filteredPastPaperGroups = useMemo(() => {
     if (selectedPastPaperFolder === "ALL") return pastPaperGroups;
@@ -1324,6 +1359,7 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
                       {task.ibLevel === "HL" && (
                         <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-300 text-[10px] font-extrabold" title="HL-only content">HL</span>
                       )}
+                      <StatementBadge task={task} className="ml-1" />
                     </div>
                   </div>
 
@@ -2164,6 +2200,13 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
                 </label>
               </div>
 
+              {selectionSourceTab === "curriculum" && (
+                <div className="p-3 rounded-xl bg-sky-50/60 border border-sky-200 space-y-1.5">
+                  <span className="text-[11px] font-bold text-slate-800">Filter by the IB guide (topic, subtopic, understanding statement)</span>
+                  <GuideTopicFilter value={guideValue} onChange={handleGuideChange} tasks={guideCountTasks} />
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <UsageLegend showThis />
                 {(usageFilter !== "all" ||
@@ -2172,6 +2215,8 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
                   difficultyFilter !== "all" ||
                   paperFilter !== "all" ||
                   levelFilter !== "All" ||
+                  guideSub ||
+                  guideStmt ||
                   searchQuery) && (
                   <button
                     type="button"
@@ -2183,6 +2228,8 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
                       setPaperFilter("all");
                       setLevelFilter("All");
                       setSearchQuery("");
+                      setGuideSub("");
+                      setGuideStmt("");
                     }}
                     className="text-[11px] font-bold text-purple-700 hover:text-purple-900 underline"
                   >
@@ -2306,6 +2353,7 @@ export const AssessmentBuilder: React.FC<AssessmentBuilderProps> = ({
                                 {t.ibLevel === "HL" && (
                                   <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-300 text-[10px] font-extrabold" title="HL-only content">HL</span>
                                 )}
+                                <StatementBadge task={t} className="ml-1" />
 
                                 <div className="flex items-center justify-between gap-2 mt-2">
                                   <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400">

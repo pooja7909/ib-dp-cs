@@ -75,6 +75,7 @@ export interface QuestionPart {
   markScheme?: string;
   options?: string[]; // For MCQ sub-parts
   correctOption?: number;
+  sqlSetup?: string; // SQL questions: CREATE TABLE + INSERT script for the in-browser SQL playground
 }
 
 export interface IGCSETask {
@@ -132,6 +133,8 @@ export interface IGCSETask {
   variationMode?: string;
   modelUsed?: string;
   createdAt?: number;
+  /** SQL questions: CREATE TABLE + INSERT script; students get a playground (tables + "try your query") next to their answer */
+  sqlSetup?: string;
 }
 
 export interface TeacherProfile {

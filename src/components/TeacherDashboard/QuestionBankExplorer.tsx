@@ -5,6 +5,7 @@ import { QuestionPreviewModal } from "./QuestionPreviewModal";
 import { buildQuestionUsage, matchesUsageFilter, usageStripeClass, UsageBadges, UsageLegend, UsageFilter } from "./QuestionUsage";
 import { isIBUnitCode, matchesIBLevel } from "../../utils/ibTopics";
 import { SimilarQuestionModal } from "./SimilarQuestionModal";
+import { GuideTopicFilter, GuideFilterValue, matchesGuideFilter, StatementBadge } from "./GuideTopicFilter";
 import { PythonSnippetViewer } from "../PythonSnippetViewer";
 import { teacherFetch } from "../../utils/teacherAuth";
 import {
@@ -75,6 +76,9 @@ export const QuestionBankExplorer: React.FC<QuestionBankExplorerProps> = ({
   const [selectedPaper, setSelectedPaper] = useState<"ALL" | "Paper 1" | "Paper 2">("ALL");
   // IB level: SL hides HL-only questions; HL and All show everything
   const [levelFilter, setLevelFilter] = useState<"All" | "SL" | "HL">("All");
+  // Guide-topic filter: the topic is the selected IB unit; subtopic / statement narrow it further
+  const [guideSub, setGuideSub] = useState<string>("");
+  const [guideStmt, setGuideStmt] = useState<string>("");
   const [previewTaskId, setPreviewTaskId] = useState<string>("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalTask, setModalTask] = useState<IGCSETask | null>(null);
@@ -192,7 +196,20 @@ export const QuestionBankExplorer: React.FC<QuestionBankExplorerProps> = ({
     }
   };
 
-  const filteredTasks = useMemo(() => {
+  const guideTopic = isIBUnitCode(selectedUnit) ? selectedUnit : "";
+  const guideValue: GuideFilterValue = {
+    topic: guideTopic,
+    subtopic: guideTopic && guideSub.startsWith(guideTopic) ? guideSub : "",
+    statement: guideTopic && guideStmt.startsWith(guideTopic) ? guideStmt : "",
+  };
+  const handleGuideChange = (v: GuideFilterValue) => {
+    if (v.topic !== guideTopic) handleSelectUnit(v.topic || "ALL");
+    setGuideSub(v.subtopic);
+    setGuideStmt(v.statement);
+  };
+
+  // Every filter except the guide subtopic / statement (used for the guide filter's counts)
+  const preGuideTasks = useMemo(() => {
     return allTasksList.filter((t) => {
       const isPast = isPastPaperTask(t);
       const isSim = Boolean(
@@ -249,6 +266,24 @@ export const QuestionBankExplorer: React.FC<QuestionBankExplorerProps> = ({
       return true;
     });
   }, [allTasksList, selectedSource, selectedPastPaperFolder, selectedUnit, selectedPaper, levelFilter, selectedType, selectedDifficulty, searchQuery, usageFilter, usageMap]);
+
+  const filteredTasks = useMemo(
+    () => (guideValue.subtopic || guideValue.statement ? preGuideTasks.filter((t) => matchesGuideFilter(t, guideValue)) : preGuideTasks),
+    [preGuideTasks, guideValue.subtopic, guideValue.statement]
+  );
+
+  // Counts for the guide filter ignore the topic selection so every topic shows its total
+  const guideCountTasks = useMemo(
+    () =>
+      allTasksList.filter(
+        (t) =>
+          (selectedPaper === "ALL" || getTaskPaper(t) === selectedPaper) &&
+          matchesIBLevel(t, levelFilter) &&
+          (selectedType === "ALL" || t.type === selectedType) &&
+          (selectedDifficulty === "ALL" || getTaskDifficulty(t) === selectedDifficulty)
+      ),
+    [allTasksList, selectedPaper, levelFilter, selectedType, selectedDifficulty]
+  );
 
   const usageCounts = useMemo(() => {
     let exam = 0;
@@ -714,6 +749,23 @@ export const QuestionBankExplorer: React.FC<QuestionBankExplorerProps> = ({
         </div>
       </div>
 
+      {/* IB guide topic filter: topic -> subtopic -> understanding statement, with question counts */}
+      <div className="p-3 bg-sky-50/60 border border-sky-200 rounded-xl space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-bold text-slate-800">Filter by the IB guide (topic, subtopic, understanding statement)</span>
+          {(guideValue.topic || guideValue.subtopic || guideValue.statement) && (
+            <button
+              type="button"
+              onClick={() => handleGuideChange({ topic: "", subtopic: "", statement: "" })}
+              className="text-[11px] font-bold text-sky-800 underline"
+            >
+              Clear guide filter
+            </button>
+          )}
+        </div>
+        <GuideTopicFilter value={guideValue} onChange={handleGuideChange} tasks={guideCountTasks} />
+      </div>
+
       {/* Dedicated Past Examination Papers Year / Series Folder Navigation */}
       {(selectedSource === "PAST_PAPERS" || selectedUnit === "ALL_PAST_PAPERS" || selectedUnit.startsWith("P2") || selectedUnit === "Y11") && (
         <div className="bg-gradient-to-r from-blue-50/90 via-sky-50/60 to-indigo-50/90 border border-blue-200 rounded-2xl p-4 space-y-3 shadow-sm">
@@ -889,6 +941,8 @@ export const QuestionBankExplorer: React.FC<QuestionBankExplorerProps> = ({
                   setSelectedType("ALL");
                   setSelectedDifficulty("ALL");
                   setSearchQuery("");
+                  setGuideSub("");
+                  setGuideStmt("");
                 }}
                 className="px-3 py-1.5 rounded-lg bg-purple-100 text-purple-700 font-bold hover:bg-purple-200"
               >
@@ -961,6 +1015,7 @@ export const QuestionBankExplorer: React.FC<QuestionBankExplorerProps> = ({
                     {task.ibLevel === "HL" && (
                       <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-300 text-[10px] font-extrabold" title="HL-only content">HL</span>
                     )}
+                    <StatementBadge task={task} className="ml-1" />
                   </div>
 
                   {/* Action row on card */}

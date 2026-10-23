@@ -8,6 +8,7 @@ import { QuestionFilesPanel } from "./QuestionFilesPanel";
 import { looksLikeCodingTask, starterForCodeWindow, DRAWING_HINT } from "../utils/codingTask";
 import { PythonSnippetViewer } from "./PythonSnippetViewer";
 import { AiPracticeScaffoldPanel } from "./StudentExam/AiPracticeScaffoldPanel";
+import { SqlPlayground } from "./Sql/SqlPlayground";
 import {
   Play,
   RotateCcw,
@@ -227,6 +228,33 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({
 
       {/* Data files the question uses (e.g. scores.txt), so students can see what is inside */}
       <QuestionFilesPanel task={task} />
+
+      {/* SQL questions: the tables (with sample data) and a "try your query" runner. Marking is unchanged. */}
+      {task.sqlSetup && (
+        <div className="my-4">
+          <SqlPlayground
+            key={task.id}
+            setup={task.sqlSetup}
+            title="SQL playground - try your query"
+            collapsibleTables
+            testId="question-sql-playground"
+            intro={
+              <>
+                These are the tables from the question, with sample data. Test your SQL here first - running it does not change your answer.
+                Then write your final SQL in the answer box{task.type === "theory" ? " (or use the copy button)" : ""}.
+              </>
+            }
+            onUseQuery={
+              task.type === "theory"
+                ? (q) => {
+                    const cur = typeof studentAnswer === "string" ? studentAnswer : "";
+                    onAnswerChange(cur.trim() ? `${cur.replace(/\s+$/, "")}\n${q.trim()}` : q.trim());
+                  }
+                : undefined
+            }
+          />
+        </div>
+      )}
 
       {/* Type-Specific Interactive Inputs */}
       {/* Code window switch for written questions */}
